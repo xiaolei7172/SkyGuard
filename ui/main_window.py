@@ -1199,7 +1199,7 @@ class MainWindow(QWidget):
         if self.tray_icon:
             mem_info = self.memory_cleaner.get_memory_info() if self.memory_cleaner.running else None
             mem_usage = f" - 内存: {mem_info['percent']:.1f}%" if mem_info else ""
-            self.tray_icon.setToolTip(f"ACE-KILLER - {'运行中' if self.monitor.running else '已停止'}{mem_usage}")
+            self.tray_icon.setToolTip(f"SkyGuard - {'运行中' if self.monitor.running else '已停止'}{mem_usage}")
 
     def update_memory_status(self):
         """更新内存状态显示"""
@@ -2081,7 +2081,7 @@ class MainWindow(QWidget):
         if success_count > 0:
             if self.monitor.config_manager.show_notifications:
                 send_notification(
-                    title="ACE-KILLER 服务删除",
+                    title="SkyGuard 服务删除",
                     message=f"已成功删除 {success_count} 个ACE服务",
                     icon_path=self.icon_path,
                 )
@@ -2345,7 +2345,7 @@ class MainWindow(QWidget):
         if success_count > 0:
             if self.monitor.config_manager.show_notifications:
                 send_notification(
-                    title="ACE-KILLER 服务停止",
+                    title="SkyGuard 服务停止",
                     message=f"已成功停止 {success_count} 个ACE服务",
                     icon_path=self.icon_path,
                 )
@@ -2376,7 +2376,7 @@ class MainWindow(QWidget):
 
             # 发送通知
             if self.monitor.config_manager.show_notifications:
-                send_notification(title="ACE-KILLER", message="ACE反作弊程序启动命令已执行", icon_path=self.icon_path)
+                send_notification(title="SkyGuard", message="ACE反作弊程序启动命令已执行", icon_path=self.icon_path)
 
         except Exception as e:
             error_msg = f"启动ACE反作弊程序失败: {str(e)}"
@@ -2411,7 +2411,7 @@ class MainWindow(QWidget):
 
             # 发送通知
             if self.monitor.config_manager.show_notifications:
-                send_notification(title="ACE-KILLER", message="ACE反作弊程序卸载命令已执行。", icon_path=self.icon_path)
+                send_notification(title="SkyGuard", message="ACE反作弊程序卸载命令已执行。", icon_path=self.icon_path)
 
         except Exception as e:
             error_msg = f"卸载ACE反作弊程序失败: {str(e)}"

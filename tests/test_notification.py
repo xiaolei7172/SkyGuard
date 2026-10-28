@@ -2,8 +2,8 @@ from windows_toasts import InteractableWindowsToaster, Toast, WindowsToaster, To
 
 interactableToaster = InteractableWindowsToaster("")
 
-newToast = Toast(text_fields=['ACE-KILLER 通知', 'Hello there! You just won a thousand dollars! Click me to claim it!'])
-newToast.AddImage(ToastDisplayImage.fromPath('E:/GitHub/ACE-KILLER/assets/icon/favicon.ico', position=ToastImagePosition.AppLogo))
+newToast = Toast(text_fields=['SkyGuard 通知', 'Hello there! You just won a thousand dollars! Click me to claim it!'])
+newToast.AddImage(ToastDisplayImage.fromPath('E:/GitHub/SkyGuard/assets/icon/favicon.ico', position=ToastImagePosition.AppLogo))
 
 # Add two actions (buttons)
 newToast.AddAction(ToastButton('Test 1', 'response=decent', launch='https://www.google.com'))

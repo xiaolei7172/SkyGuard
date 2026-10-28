@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ACE-KILLER主程序入口
+SkyGuard主程序入口
 """
 
 import sys

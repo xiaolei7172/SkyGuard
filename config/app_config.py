@@ -7,13 +7,13 @@
 
 # 应用程序基本信息
 APP_INFO = {
-    "name": "ACE-Killer",                          # 应用名称
-    "author": "CassianVale",                  # 作者
+    "name": "SkyGuard",                        # 应用名称（同时决定构建产物名 SkyGuard.exe）
+    "author": "xiaolei7172",                   # 维护者（原作者 CassianVale，见 README 致谢）
     "version": "1.0.0",                       # 版本号（会被GitHub Actions构建时替换）
-    "description": "ACE-Killer",      # 应用描述
-    "github_repo": "Cassianvale/ACE-Killer",       # GitHub仓库
-    "github_api_url": "https://api.github.com/repos/Cassianvale/ACE-Killer/releases/latest",  # GitHub API URL
-    "github_releases_url": "https://github.com/Cassianvale/ACE-Killer/releases",              # GitHub发布页面URL
+    "description": "天幕进程优化工具 · 游戏反作弊进程管理",      # 应用描述
+    "github_repo": "xiaolei7172/SkyGuard",         # GitHub仓库
+    "github_api_url": "https://api.github.com/repos/xiaolei7172/SkyGuard/releases/latest",  # GitHub API URL
+    "github_releases_url": "https://github.com/xiaolei7172/SkyGuard/releases",              # GitHub发布页面URL
 }
 
 # 用户默认配置
@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
 
 # 系统配置
 SYSTEM_CONFIG = {
-    "config_dir_name": ".ace-killer",         # 配置目录名称
+    "config_dir_name": ".skyguard",           # 配置目录名称（改名后与旧版 ACE-KILLER 配置互不影响）
     "log_dir_name": "logs",                   # 日志目录名称
     "config_file_name": "config.yaml",        # 配置文件名称
     "network_timeout": 10,                    # 网络请求超时时间（秒）

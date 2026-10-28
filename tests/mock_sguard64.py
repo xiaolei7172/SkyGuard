@@ -3,7 +3,7 @@
 
 """
 模拟SGuard64.exe进程的测试脚本
-用于测试ACE-KILLER的进程监控和优化功能
+用于测试SkyGuard的进程监控和优化功能
 
 pyinstaller --onefile --name SGuard64 mock_sguard64.py
 """
