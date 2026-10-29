@@ -21,6 +21,9 @@ from utils.system_utils import (
 )
 from utils.memory_cleaner import get_memory_cleaner
 from utils.process_io_priority import get_io_priority_manager, get_io_priority_service, IO_PRIORITY_HINT
+from utils.clean_engine import get_clean_engine, format_size
+from utils.startup_manager import get_startup_manager
+from utils.clean_rules import get_rules as get_clean_rules
 
 from utils.notification import find_icon_path, create_notification_thread
 
@@ -46,4 +49,8 @@ __all__ = [
     "get_io_priority_manager",
     "get_io_priority_service",
     "IO_PRIORITY_HINT",
+    "get_clean_engine",
+    "format_size",
+    "get_startup_manager",
+    "get_clean_rules",
 ]

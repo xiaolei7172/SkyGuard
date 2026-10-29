@@ -9,7 +9,7 @@
 APP_INFO = {
     "name": "SkyGuard",                        # 应用名称（同时决定构建产物名 SkyGuard.exe）
     "author": "xiaolei7172",                   # 维护者（原作者 CassianVale，见 README 致谢）
-    "version": "1.0.0",                       # 版本号（会被GitHub Actions构建时替换）
+    "version": "1.1.0",                       # 版本号（会被GitHub Actions构建时替换）
     "description": "天幕进程优化工具 · 游戏反作弊进程管理",      # 应用描述
     "github_repo": "xiaolei7172/SkyGuard",         # GitHub仓库
     "github_api_url": "https://api.github.com/repos/xiaolei7172/SkyGuard/releases/latest",  # GitHub API URL

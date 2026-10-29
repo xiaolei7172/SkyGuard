@@ -49,6 +49,7 @@ from utils import (
 
 from ui.process_io_priority_manager import show_process_io_priority_manager
 from ui.components.custom_titlebar import CustomTitleBar
+from ui.pages import DiskCleanPage, StartupPage
 from ui.styles import (
     ColorScheme,
     StyleHelper,
@@ -643,11 +644,28 @@ class MainWindow(QWidget):
         # 添加空白占位
         settings_layout.addStretch()
 
+        # 垃圾清理选项卡
+        self.disk_clean_page = DiskCleanPage()
+        # 开机优化选项卡
+        self.startup_page = StartupPage()
+
         # 添加选项卡
         self.tabs.addTab(status_tab, "  程序状态  ")
         self.tabs.addTab(process_tab, "  进程监控  ")
         self.tabs.addTab(memory_tab, "  内存清理  ")
+        self.tabs.addTab(self.disk_clean_page, "  🧹 垃圾清理  ")
+        self.tabs.addTab(self.startup_page, "  🚀 开机优化  ")
         self.tabs.addTab(settings_tab, "  设置  ")
+
+        # 首次切到这两个页时再加载数据，避免启动变慢
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _on_tab_changed(self, index):
+        """按需懒加载新页面数据"""
+        widget = self.tabs.widget(index)
+        if widget is self.startup_page and not getattr(self, "_startup_loaded", False):
+            self._startup_loaded = True
+            self.startup_page.refresh()
 
     def setup_tray(self):
         """设置系统托盘图标"""
