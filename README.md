@@ -200,5 +200,3 @@
 
 - **本项目采用 `GNU General Public License v3.0`** - 详见 [LICENSE](LICENSE) 文件
 - 🙌 本项目基于 [Cassianvale/ACE-KILLER](https://github.com/Cassianvale/ACE-KILLER)（GPL-3.0）二次开发，感谢原作者 [CassianVale](https://github.com/Cassianvale) 与 [Tomatocicier](https://github.com/Tomatocicier) 的贡献。原项目已无限期停更，本仓库在其基础上以 SkyGuard 之名继续维护
-
-<!-- release: v1.3.0 -->
