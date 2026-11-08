@@ -2,7 +2,7 @@
 
 # 🛡️ SkyGuard · 天幕进程优化工具
 
-游戏反作弊进程管理工具，专为无畏契约、三角洲行动等使用 ACE 反作弊的游戏设计。
+以游戏反作弊进程管理为核心，集内存清理、垃圾清理、开机优化、DNS 广告过滤与 GitHub / Steam 网络加速于一体的 Windows 系统工具箱。
 
 <div>
     <img alt="platform" src="https://img.shields.io/badge/Platform-Windows-blue?style=flat-square&logo=windows">
@@ -153,17 +153,23 @@
 ## 🏠 项目展示
 
 <div align="center">
-  <img src="assets/image/1.png" width="45%" alt="应用界面预览">
-  <img src="assets/image/2.png" width="45%" alt="进程监控界面预览1">
-</div>
 
-<div align="center">
-  <img src="assets/image/3.png" width="45%" alt="内存清理界面预览">
-  <img src="assets/image/4.png" width="45%" alt="设置界面预览">
-</div>
+| 程序状态 | 🚀 网络加速 |
+| :---: | :---: |
+| ![程序状态](assets/image/1.png) | ![网络加速](assets/image/2.png) |
 
-<div align="center">
-  <img src="assets/image/5.png" width="80%" alt="进程监控界面预览2">
+| 🛡 DNS 过滤器 | 进程监控 |
+| :---: | :---: |
+| ![DNS 过滤器](assets/image/3.png) | ![进程监控](assets/image/4.png) |
+
+| 🧹 垃圾清理 | 内存清理 |
+| :---: | :---: |
+| ![垃圾清理](assets/image/5.png) | ![内存清理](assets/image/6.png) |
+
+| 🚀 开机优化 | 设置 |
+| :---: | :---: |
+| ![开机优化](assets/image/7.png) | ![设置](assets/image/8.png) |
+
 </div>
 
 ## 😶‍🌫️ 进程模式策略
