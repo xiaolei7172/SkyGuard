@@ -343,7 +343,7 @@ class ThemeManager(QObject):
             padding: 4px 8px;
             font-size: 12px;
             color: {colors.GRAY_9};
-            min-width: 100px;
+            min-width: 64px;
             min-height: 26px;
         }}
         

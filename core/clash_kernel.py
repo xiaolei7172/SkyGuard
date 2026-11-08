@@ -183,13 +183,16 @@ def build_config(subscriptions, manual_nodes, rules, *, mixed_port=7890,
         url = (sub.get("url") or "").strip()
         if not url:
             continue
-        name = "sub_" + "".join(
-            c if c.isalnum() else "_" for c in (sub.get("name") or f"s{i}"))[:24]
+        if not sub.get("enabled", True):
+            continue
+        name = provider_name(sub.get("name") or f"s{i}")
+        # 订阅自己的更新间隔（分钟），未设置时按天
+        interval = max(60, int(sub.get("interval", 1440) or 1440) * 60)
         providers[name] = {
             "type": "http",
             "url": url,
             "path": f"./providers/{name}.yaml",
-            "interval": 86400,
+            "interval": interval,
             "health-check": {
                 "enable": True,
                 "url": "http://www.gstatic.com/generate_204",
@@ -285,6 +288,12 @@ def build_config(subscriptions, manual_nodes, rules, *, mixed_port=7890,
         "proxy-groups": [group],
         "rules": rules_out,
     }
+
+
+def provider_name(sub_name):
+    """订阅名 → proxy-provider 名（与 build_config 保持一致）。"""
+    return "sub_" + "".join(
+        c if c.isalnum() else "_" for c in (sub_name or "s"))[:24]
 
 
 def node_to_clash(node):
@@ -454,6 +463,10 @@ class MihomoKernel:
         return {k: int(v.get("delay", 0)) for k, v in (data or {}).items()
                 if isinstance(v, dict)}
 
+    def update_provider(self, provider):
+        """立即更新一个订阅源（mihomo 会重新拉取该 provider）。"""
+        return self._request("PUT", f"/providers/proxies/{_quote(provider)}", timeout=30)
+
     def set_mode(self, mode):
         return self._request("PATCH", "/configs", {"mode": mode})
 
@@ -471,6 +484,7 @@ class MihomoKernel:
             meta = c.get("metadata", {})
             chains = c.get("chains") or []
             rows.append({
+                "id": c.get("id", ""),
                 "host": meta.get("host") or meta.get("destinationIP", ""),
                 "port": int(meta.get("destinationPort", 0) or 0),
                 "node": chains[0] if chains else "",
@@ -480,6 +494,10 @@ class MihomoKernel:
                 "start": c.get("start", ""),
             })
         return rows
+
+    def close_connection(self, conn_id):
+        """断开一条活动连接。"""
+        return self._request("DELETE", f"/connections/{_quote(conn_id)}")
 
     def close_all_connections(self):
         self._request("DELETE", "/connections")

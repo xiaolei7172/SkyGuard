@@ -12,12 +12,15 @@
 所有网络操作都在后台线程，通过 ui_call 信号回主线程刷新界面。
 """
 
+import math
 import os
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
@@ -33,16 +36,97 @@ from core.geo import get_classifier
 from core.local_proxy import (
     ACTION_ACCEL, ACTION_DIRECT, ACTION_PROXY, ACTION_REJECT,
     DEFAULT_RULES, MODE_DIRECT, MODE_GLOBAL, MODE_RULE, MODE_SMART,
-    LocalProxy, format_bytes,
+    MODES, LocalProxy, RuleEngine, format_bytes,
 )
 from core.proxy_connectors import probe_node
 from core.proxy_nodes import (
     KNOWN_UNSUPPORTED, NodeStore, ProxyNode, fetch_subscription,
+    fetch_subscription_ex, format_traffic,
     parse_proxy_uri, parse_subscription,
 )
 from ui.styles import StyleHelper
 from utils import system_proxy
 from utils.logger import logger
+
+
+class TrafficGraph(QWidget):
+    """上下行实时速率折线图（Clash Verge 的流量图，轻量自绘版）。
+
+    push(up, down) 喂入每秒速率（字节/秒），内部保留最近 max_points 个点，
+    自动按峰值归一化，零依赖、无定时器，只在数据到来时重绘。
+    """
+
+    def __init__(self, max_points=120, parent=None):
+        super().__init__(parent)
+        self.max_points = max_points
+        self.up = deque(maxlen=max_points)
+        self.down = deque(maxlen=max_points)
+        self.setMinimumHeight(96)
+        self.setToolTip("每秒上下行速率（自动按峰值缩放）")
+
+    def push(self, up_rate, down_rate):
+        self.up.append(max(0.0, float(up_rate)))
+        self.down.append(max(0.0, float(down_rate)))
+        self.update()
+
+    def clear(self):
+        self.up.clear()
+        self.down.clear()
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        bg = self.palette().color(self.backgroundRole())
+        painter.fillRect(QRectF(0, 0, w, h), bg)
+
+        peak = max(list(self.up) + list(self.down) + [1.0])
+        # 网格
+        painter.setPen(QPen(self.palette().color(self.foregroundRole()), 1))
+        for i in range(1, 3):
+            y = h * i / 3.0
+            painter.drawLine(QPointF(0, y), QPointF(w, y))
+        for i in range(1, 6):
+            x = w * i / 6.0
+            painter.drawLine(QPointF(x, 0), QPointF(x, h))
+
+        def series(values, color):
+            if len(values) < 2:
+                return
+            poly = QPolygonF()
+            n = len(values)
+            for i, v in enumerate(values):
+                x = w * i / max(1, self.max_points - 1)
+                y = h - min(1.0, v / peak) * (h - 4) - 2
+                poly.append(QPointF(x, y))
+            painter.setPen(QPen(color, 1.6))
+            painter.drawPolyline(poly)
+
+        series(self.down, Qt.GlobalColor.darkCyan)
+        series(self.up, Qt.GlobalColor.darkGreen)
+
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        label = f"↓{format_bytes(peak)} 峰值  ·  {len(self.up)}s"
+        metrics = painter.fontMetrics()
+        rect = QRectF(4, 3, metrics.horizontalAdvance(label) + 10, 16)
+        painter.fillRect(rect, bg)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+
+
+def _delay_color(ms):
+    """延迟配色：绿 <200ms，黄 <500ms，其余红（Clash Verge 口径）。"""
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        return None
+    if ms <= 0:
+        return None
+    if ms < 200:
+        return QColor("#389e0d")
+    if ms < 500:
+        return QColor("#d48806")
+    return QColor("#cf1322")
 
 MODE_LABELS = (
     ("智能分流", MODE_SMART),
@@ -53,16 +137,16 @@ MODE_LABELS = (
 ACTION_LABELS = (
     ("加速直连", ACTION_ACCEL),
     ("直连", ACTION_DIRECT),
-    ("走代理", ACTION_PROXY),
+    ("代理", ACTION_PROXY),
     ("拒绝", ACTION_REJECT),
 )
 
 # 规则类型：界面显示短中文标签，存储仍是内核识别的英文类型
 RULE_TYPE_LABELS = (
-    ("域名后缀", "domain-suffix"),
-    ("完整域名", "domain"),
-    ("域名关键字", "domain-keyword"),
-    ("域名正则", "domain-regex"),
+    ("后缀", "domain-suffix"),
+    ("域名", "domain"),
+    ("关键字", "domain-keyword"),
+    ("正则", "domain-regex"),
     ("IP 段", "ip-cidr"),
     ("兜底", "final"),
 )
@@ -108,6 +192,12 @@ class AccelPage(QWidget):
         self.stats_timer = QTimer(self)
         self.stats_timer.timeout.connect(self.refresh_stats)
         self.stats_timer.start(1500)
+
+        # 订阅自动更新巡检（每 5 分钟看一次谁到期）
+        self.sub_timer = QTimer(self)
+        self.sub_timer.timeout.connect(self._auto_update_subscriptions)
+        self.sub_timer.start(300_000)
+        self._last_traffic = None
 
         if config_manager.proxy_enabled:
             QTimer.singleShot(1800, self.on_start_proxy)
@@ -314,6 +404,7 @@ class AccelPage(QWidget):
         body.addLayout(left, 3)
         body.addLayout(right, 2)
 
+        left.addWidget(self._build_traffic_group())
         left.addWidget(self._build_subscription_group())
         left.addWidget(self._build_accel_group())
         right.addWidget(self._build_rules_group())
@@ -321,10 +412,41 @@ class AccelPage(QWidget):
         right.addStretch()
         return body
 
+    # -- 实时流量图 ---------------------------------------------------
+    def _build_traffic_group(self):
+        group = QGroupBox("实时速率")
+        box = QVBoxLayout()
+        self.traffic_graph = TrafficGraph()
+        box.addWidget(self.traffic_graph)
+        legend = QHBoxLayout()
+        for color, text in (("#237804", "■ 上行"), ("#006d75", "■ 下行")):
+            tag = QLabel(f'<span style="color:{color};font-weight:700;">{text}</span>')
+            legend.addWidget(tag)
+        legend.addStretch()
+        self.rate_label = QLabel("—")
+        self.rate_label.setStyleSheet("color: #8c8c8c;")
+        legend.addWidget(self.rate_label)
+        box.addLayout(legend)
+        group.setLayout(box)
+        return group
+
     # -- 机场 / 节点 -------------------------------------------------
     def _build_subscription_group(self):
         group = QGroupBox("机场订阅 / 节点")
         box = QVBoxLayout()
+
+        # 订阅列表（Clash Verge 风格：显示节点数 / 流量 / 到期 / 更新时间）
+        self.sub_table = QTableWidget(0, 4)
+        self.sub_table.setHorizontalHeaderLabels(["订阅", "节点数", "流量 / 到期", "更新于"])
+        self.sub_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.sub_table.verticalHeader().setVisible(False)
+        self.sub_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.sub_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.sub_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.sub_table.setMaximumHeight(110)
+        self.sub_table.setToolTip("双击更新该订阅；流量与到期信息来自订阅响应头（若机场提供）")
+        self.sub_table.doubleClicked.connect(lambda _i: self.on_update_subscriptions(True))
+        box.addWidget(self.sub_table)
 
         row = QHBoxLayout()
         self.sub_url = QLineEdit()
@@ -334,6 +456,13 @@ class AccelPage(QWidget):
         self.sub_name.setPlaceholderText("备注名（可空）")
         self.sub_name.setMaximumWidth(140)
         row.addWidget(self.sub_name, 1)
+        self.sub_interval = QComboBox()
+        self.sub_interval.setToolTip("自动更新间隔（内置引擎生效；Clash 内核由内核自己定时拉取）")
+        for label, minutes in (("手动", 0), ("6h", 360), ("12h", 720),
+                               ("24h", 1440), ("48h", 2880)):
+            self.sub_interval.addItem(label, minutes)
+        self.sub_interval.setCurrentIndex(3)
+        row.addWidget(self.sub_interval)
         add_btn = QPushButton("添加/更新")
         add_btn.clicked.connect(self.on_add_subscription)
         row.addWidget(add_btn)
@@ -353,6 +482,12 @@ class AccelPage(QWidget):
         row2.addWidget(import_btn)
         box.addLayout(row2)
 
+        self.node_search = QLineEdit()
+        self.node_search.setPlaceholderText("搜索节点（名称 / 服务器 / 来源）")
+        self.node_search.textChanged.connect(lambda _t: self.refresh_node_table())
+        self.node_search.setMaximumHeight(26)
+        box.addWidget(self.node_search)
+
         self.node_table = QTableWidget(0, 5)
         self.node_table.setHorizontalHeaderLabels(["名称", "协议", "服务器", "延迟", "来源"])
         self.node_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -371,6 +506,12 @@ class AccelPage(QWidget):
         test_btn.clicked.connect(self.on_test_nodes)
         StyleHelper.set_button_type(test_btn, "default")
         row3.addWidget(test_btn)
+        self.sort_btn = QPushButton("按延迟排序")
+        self.sort_btn.setToolTip("按延迟从低到高排序（再点一次恢复默认顺序）")
+        self.sort_btn.setCheckable(True)
+        self.sort_btn.toggled.connect(lambda _on: self.refresh_node_table())
+        StyleHelper.set_button_type(self.sort_btn, "default")
+        row3.addWidget(self.sort_btn)
         use_btn = QPushButton("使用节点")
         use_btn.setToolTip("使用当前选中的节点（也可直接双击该行）")
         use_btn.clicked.connect(self.on_use_node)
@@ -471,7 +612,8 @@ class AccelPage(QWidget):
         for label, rtype in RULE_TYPE_LABELS:
             self.rule_type.addItem(label, rtype)
         self.rule_type.setToolTip(
-            "域名后缀：匹配 xxx.com 及其子域；IP 段：如 140.82.0.0/16；兜底：其余流量")
+            "后缀=域名及其子域；域名=完整域名；关键字=包含即命中；"
+            "正则=域名正则；IP 段=如 140.82.0.0/16；兜底=其余流量")
         self._adaptive_combo(self.rule_type)
         row.addWidget(self.rule_type, 1)
         self.rule_value = QLineEdit()
@@ -511,12 +653,45 @@ class AccelPage(QWidget):
         geo_row.addWidget(update_db_btn)
         box.addLayout(geo_row)
 
+        # 规则命中测试（Clash Verge 的连接/规则页常用能力）
+        test_row = QHBoxLayout()
+        self.rule_probe = QLineEdit()
+        self.rule_probe.setPlaceholderText("测试：输入域名或 IP，看会走哪条规则")
+        test_btn = QPushButton("测试走向")
+        test_btn.clicked.connect(self.on_probe_rule)
+        StyleHelper.set_button_type(test_btn, "default")
+        test_row.addWidget(self.rule_probe, 1)
+        test_row.addWidget(test_btn)
+        box.addLayout(test_row)
+        self.rule_probe_result = QLabel("")
+        self.rule_probe_result.setWordWrap(True)
+        self.rule_probe_result.setStyleSheet("color: #389e0d;")
+        box.addWidget(self.rule_probe_result)
+
         group.setLayout(box)
         return group
 
+    def on_probe_rule(self):
+        """用当前规则引擎（与代理同源）判定一个目标的走向。"""
+        host = self.rule_probe.text().strip()
+        if not host:
+            self.rule_probe_result.setText("请输入域名或 IP。")
+            self.rule_probe_result.setStyleSheet("color: #8c8c8c;")
+            return
+        engine = self.proxy.engine
+        action, reason = engine.match(host)
+        label = {"DIRECT": "直连", "PROXY": "走代理节点",
+                 "REJECT": "拦截", "ACCEL": "加速直连"}.get(action, action)
+        mode_name = dict(MODE_LABELS).get(engine.mode, engine.mode)
+        color = {"DIRECT": "#389e0d", "PROXY": "#0958d9",
+                 "REJECT": "#cf1322", "ACCEL": "#389e0d"}.get(action, "#595959")
+        self.rule_probe_result.setText(
+            f"[{mode_name}] {host} → <b>{label}</b>（{reason}）")
+        self.rule_probe_result.setStyleSheet(f"color: {color};")
+
     # -- 连接监控 ----------------------------------------------------
     def _build_conn_group(self):
-        group = QGroupBox("最近连接")
+        group = QGroupBox("连接监控")
         box = QVBoxLayout()
 
         self.conn_table = QTableWidget(0, 5)
@@ -532,6 +707,15 @@ class AccelPage(QWidget):
         clear_btn.clicked.connect(self.on_clear_logs)
         StyleHelper.set_button_type(clear_btn, "default")
         row.addWidget(clear_btn)
+        close_btn = QPushButton("断开选中")
+        close_btn.setToolTip("断开选中的活动连接（Clash 内核模式可用）")
+        close_btn.clicked.connect(self.on_close_selected_conn)
+        StyleHelper.set_button_type(close_btn, "default")
+        row.addWidget(close_btn)
+        close_all_btn = QPushButton("断开全部")
+        close_all_btn.clicked.connect(self.on_clear_logs)
+        StyleHelper.set_button_type(close_all_btn, "default")
+        row.addWidget(close_all_btn)
         row.addStretch()
         self.conn_hint = QLabel("")
         self.conn_hint.setStyleSheet("color: #8c8c8c;")
@@ -540,6 +724,29 @@ class AccelPage(QWidget):
 
         group.setLayout(box)
         return group
+
+    def on_close_selected_conn(self):
+        """断开一条活动连接（内核模式：调 mihomo API；内置模式暂不支持）。"""
+        if self._engine() != "clash":
+            QMessageBox.information(self, "断开连接",
+                                    "内置引擎暂不支持断开单条连接，可切到 Clash 内核使用。")
+            return
+        if not (self.kernel is not None and self.kernel.running):
+            return
+        row = self.conn_table.currentRow()
+        conn_ids = getattr(self, "_conn_ids", [])
+        if row < 0 or row >= len(conn_ids):
+            QMessageBox.information(self, "断开连接", "请先在表格中选中一条连接。")
+            return
+        conn_id = conn_ids[row]
+        if not conn_id:
+            return
+
+        def work():
+            self.kernel.close_connection(conn_id)
+
+        self._run(work, lambda _r: self.conn_hint.setText("已断开选中连接"),
+                  lambda e: self.conn_hint.setText(f"断开失败：{e}"))
 
     def _style_pill(self, running):
         color = "#52c41a" if running else "#bfbfbf"
@@ -792,6 +999,7 @@ class AccelPage(QWidget):
         self.stat_cards["accel"].setText(str(snap["accel"]))
         traffic = f"↑{format_bytes(snap['up'])}  ↓{format_bytes(snap['down'])}"
         self.stat_cards["traffic"].setText(traffic)
+        self._push_rates(snap["up"], snap["down"])
 
         rows = snap["recent"]
         # 数据没变化就不重建表格，避免每秒抢焦点、滚动条乱跳
@@ -833,6 +1041,7 @@ class AccelPage(QWidget):
         self.stat_cards["accel"].setText(str(len(conns) - proxied))
         traffic = f"↑{format_bytes(info['up'])}  ↓{format_bytes(info['down'])}"
         self.stat_cards["traffic"].setText(traffic)
+        self._push_rates(info["up"], info["down"])
 
         rows = []
         for c in reversed(conns):
@@ -850,6 +1059,7 @@ class AccelPage(QWidget):
         if sig == self._stats_sig:
             return
         self._stats_sig = sig
+        self._conn_ids = [c["id"] for c in reversed(conns)]
         self.conn_table.setRowCount(len(rows))
         for r, item in enumerate(rows):
             target = f"{item['host']}:{item['port']}"
@@ -862,6 +1072,19 @@ class AccelPage(QWidget):
                 if c in (0, 2, 4):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.conn_table.setItem(r, c, cell)
+
+    def _push_rates(self, up_total, down_total):
+        """把累计字节数换算成每秒速率，喂给流量曲线。"""
+        now = time.monotonic()
+        last = self._last_traffic
+        self._last_traffic = (now, up_total, down_total)
+        if not last or now <= last[0]:
+            return
+        dt = now - last[0]
+        up_rate = max(0.0, (up_total - last[1]) / dt)
+        down_rate = max(0.0, (down_total - last[2]) / dt)
+        self.traffic_graph.push(up_rate, down_rate)
+        self.rate_label.setText(f"↑ {format_bytes(int(up_rate))}/s   ↓ {format_bytes(int(down_rate))}/s")
 
     def on_clear_logs(self):
         if self._engine() == "clash":
@@ -882,13 +1105,22 @@ class AccelPage(QWidget):
     # ------------------------------------------------------------------
     def refresh_node_table(self, latencies=None):
         latencies = latencies or {}
+        self.refresh_sub_table()
         if self._engine() == "clash":
             self._refresh_node_table_kernel(latencies)
             return
+        keyword = self.node_search.text().strip().lower()
         nodes = self.node_store.all_nodes()
-        self.node_table.setRowCount(len(nodes))
-        for r, node in enumerate(nodes):
-            ms = latencies.get(node.uid)
+        rows = []
+        for node in nodes:
+            label = " ".join((node.name, node.server, node.subscription or ""))
+            if keyword and keyword not in label.lower():
+                continue
+            rows.append((node, latencies.get(node.uid)))
+        if self.sort_btn.isChecked():
+            rows.sort(key=lambda pair: (pair[1] or 99999, pair[0].name))
+        self.node_table.setRowCount(len(rows))
+        for r, (node, ms) in enumerate(rows):
             values = [
                 ("★ " if node.uid == self.selected_uid else "") + node.name,
                 node.type.upper(),
@@ -897,16 +1129,19 @@ class AccelPage(QWidget):
                 node.subscription or "手动",
             ]
             for c, text in enumerate(values):
-                cell = QTableWidgetItem(text)
+                cell = QTableWidgetItem(str(text))
                 if c in (1, 3, 4):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if c == 0:
                     cell.setToolTip(node.uid)
+                if c == 3 and ms:
+                    cell.setForeground(_delay_color(ms))
                 self.node_table.setItem(r, c, cell)
 
         total = len(nodes)
         subs = len(self.node_store.subscriptions)
-        self.sub_hint.setText(f"{subs} 个订阅 · 共 {total} 个可用节点"
+        shown = f" · 筛出 {len(rows)} 个" if keyword else ""
+        self.sub_hint.setText(f"{subs} 个订阅 · 共 {total} 个可用节点{shown}"
                               if total else "还没有节点，先添加订阅或手动填一条链接")
         self.refresh_status()
 
@@ -928,11 +1163,18 @@ class AccelPage(QWidget):
                                                         "compatible", "pass"):
                     continue
                 rows.append((name, meta))
-        self._kernel_rows = rows
-        self.node_table.setRowCount(len(rows))
-        for r, (name, meta) in enumerate(rows):
+        keyword = self.node_search.text().strip().lower()
+        if keyword:
+            rows = [(n, m) for n, m in rows if keyword in n.lower()]
+        decorated = []
+        for name, meta in rows:
             hist = meta.get("history") or []
             ms = latencies.get(name) or (hist[-1].get("delay") if hist else 0)
+            decorated.append((name, meta, ms))
+        if self.sort_btn.isChecked():
+            decorated.sort(key=lambda item: (item[2] or 99999, item[0]))
+        self.node_table.setRowCount(len(decorated))
+        for r, (name, meta, ms) in enumerate(decorated):
             values = [
                 ("★ " if name == self.selected_kernel_node else "") + name,
                 str(meta.get("type", "")).upper(),
@@ -941,9 +1183,11 @@ class AccelPage(QWidget):
                 "内核",
             ]
             for c, text in enumerate(values):
-                cell = QTableWidgetItem(text)
+                cell = QTableWidgetItem(str(text))
                 if c in (1, 3, 4):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if c == 3 and ms:
+                    cell.setForeground(_delay_color(ms))
                 self.node_table.setItem(r, c, cell)
         if rows:
             self.sub_hint.setText(f"mihomo 内核 · {len(rows)} 个节点"
@@ -963,6 +1207,8 @@ class AccelPage(QWidget):
         if self._engine() == "clash":
             # 内核模式：订阅交给 mihomo 拉取，hysteria2 / vless 等协议原生支持
             self.node_store.add_subscription(name or url, url)
+            self.node_store.set_subscription_state(
+                name or url, interval=self.sub_interval.currentData())
             self.sub_url.clear()
             self.sub_name.clear()
             self.sub_hint.setText("订阅已保存，mihomo 将自动拉取（含 hysteria2 / vless 节点）")
@@ -975,12 +1221,12 @@ class AccelPage(QWidget):
         self.sub_hint.setText("正在拉取订阅…")
 
         def work():
-            text = fetch_subscription(url)
+            text, meta = fetch_subscription_ex(url)
             nodes, skipped = parse_subscription(text, name or url)
-            return nodes, skipped
+            return nodes, skipped, meta
 
         def done(result):
-            nodes, skipped = result
+            nodes, skipped, meta = result
             if not nodes:
                 detail = "、".join(f"{k}×{v}" for k, v in skipped.items())
                 tip = f"没有可用的节点（{detail}）" if detail else "订阅里没有识别到节点"
@@ -991,7 +1237,9 @@ class AccelPage(QWidget):
                 QMessageBox.warning(self, "订阅", tip + ("\n" + extra if extra else "") + hint)
                 self.sub_hint.setText("订阅解析失败（可切换 Clash 内核后重试）")
                 return
-            self.node_store.upsert_subscription(name or url, url, nodes)
+            self.node_store.upsert_subscription(name or url, url, nodes, meta=meta)
+            self.node_store.set_subscription_state(
+                name or url, interval=self.sub_interval.currentData())
             self.refresh_node_table()
             msg = f"已导入 {len(nodes)} 个节点"
             if skipped:
@@ -1029,6 +1277,122 @@ class AccelPage(QWidget):
         self.sub_url.setText(path)
         self.sub_name.setText(os.path.basename(path))
         self.on_add_subscription()
+
+    # ------------------------------------------------------------------
+    # 订阅面板（Clash Verge 风格：流量 / 到期 / 自动更新）
+    # ------------------------------------------------------------------
+    def refresh_sub_table(self):
+        subs = self.node_store.subscriptions
+        self._sub_row_urls = []
+        self.sub_table.setRowCount(len(subs))
+        for r, sub in enumerate(subs):
+            name = sub.get("name") or sub.get("url", "")
+            if not sub.get("enabled", True):
+                name += "（已停用）"
+            meta = sub.get("meta") or {}
+            traffic = "—"
+            if meta.get("info_present"):
+                used = int(meta.get("upload", 0) or 0) + int(meta.get("download", 0) or 0)
+                total = int(meta.get("total", 0) or 0)
+                traffic = f"{format_traffic(used)} / {format_traffic(total) if total else '不限'}"
+                if meta.get("expire"):
+                    left_days = (int(meta["expire"]) - time.time()) / 86400
+                    if left_days > 0:
+                        traffic += f" · 剩 {left_days:.0f} 天"
+                    else:
+                        traffic += " · 已到期"
+            updated = time.strftime("%m-%d %H:%M", time.localtime(sub["updated"])) \
+                if sub.get("updated") else "从未更新"
+            cells = [name, str(len(sub.get("nodes") or [])), traffic, updated]
+            self._sub_row_urls.append(sub.get("url", ""))
+            for c, text in enumerate(cells):
+                cell = QTableWidgetItem(str(text))
+                if c in (1, 3):
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if sub.get("error"):
+                    cell.setToolTip(f"上次更新失败：{sub['error']}")
+                self.sub_table.setItem(r, c, cell)
+
+    def on_update_subscriptions(self, only_selected=False, targets=None):
+        """更新订阅。内置引擎重新拉取并解析；内核模式让 mihomo 重拉 provider。"""
+        if getattr(self, "_updating_subs", False):
+            return
+        subs = self.node_store.subscriptions
+        if targets is not None:
+            todo = targets
+        elif only_selected:
+            row = self.sub_table.currentRow()
+            if row < 0 or row >= len(subs):
+                QMessageBox.information(self, "更新订阅", "请先在订阅列表中选中一行。")
+                return
+            todo = [subs[row]]
+        else:
+            todo = [s for s in subs if s.get("enabled", True)]
+        if not todo:
+            self.sub_hint.setText("没有可更新的订阅")
+            return
+
+        self._updating_subs = True
+        self.sub_hint.setText(f"正在更新 {len(todo)} 个订阅…")
+
+        def work():
+            results = []
+            for sub in todo:
+                name = sub.get("name") or sub.get("url", "")
+                url = sub.get("url", "")
+                if self._engine() == "clash":
+                    # 内核模式：让 mihomo 立即重拉 provider
+                    err = ""
+                    try:
+                        if self.kernel is not None and self.kernel.running:
+                            self.kernel.update_provider(clash_kernel.provider_name(name))
+                        else:
+                            err = "内核未运行"
+                    except OSError as e:
+                        err = str(e)
+                    results.append((name, 0, err))
+                    continue
+                try:
+                    text, meta = fetch_subscription_ex(url)
+                    nodes, skipped = parse_subscription(text, name)
+                    if not nodes and not skipped and meta.get("local"):
+                        raise ValueError("本地文件为空")
+                    self.node_store.upsert_subscription(name, url, nodes, meta=meta)
+                    results.append((name, len(nodes), None))
+                except Exception as e:
+                    self.node_store.update_subscription_meta(name, error=str(e))
+                    results.append((name, 0, str(e)))
+            return results
+
+        def done(results):
+            self._updating_subs = False
+            ok = [f"{n}（{c} 节点）" for n, c, err in results if not err]
+            bad = [f"{n}：{err}" for n, c, err in results if err]
+            if self._engine() == "clash":
+                self.refresh_node_table()
+            parts = []
+            if ok:
+                parts.append("更新成功：" + "、".join(ok))
+            if bad:
+                parts.append("失败：" + "；".join(bad))
+            self.sub_hint.setText("；".join(parts) if parts else "完成")
+            self.refresh_node_table()
+
+        def on_error(err):
+            self._updating_subs = False
+            self.sub_hint.setText(f"更新失败：{err}")
+
+        self._run(work, done, on_error)
+
+    def _auto_update_subscriptions(self):
+        """到期自动更新（内置引擎）；内核模式下 mihomo 自己按 provider 间隔拉取。"""
+        if not self.isVisible() or self._updating_subs:
+            return
+        if self._engine() == "clash":
+            return
+        due = self.node_store.due_subscriptions()
+        if due:
+            self.on_update_subscriptions(targets=due)
 
     def on_test_nodes(self):
         if self._testing_nodes:

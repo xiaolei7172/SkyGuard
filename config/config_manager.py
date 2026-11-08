@@ -356,6 +356,13 @@ class ConfigManager:
                     "block_action": self.dns_block_action,
                     "selected_upstream": self.dns_selected_upstream,
                     "upstreams": self.dns_upstreams,
+                    "strategy": self.dns_strategy,
+                    "cache_min_ttl": self.dns_cache_min_ttl,
+                    "cache_max_ttl": self.dns_cache_max_ttl,
+                    "log_enabled": self.dns_log_enabled,
+                    "lists": self.dns_lists,
+                    "custom_rules": self.dns_custom_rules,
+                    "rewrites": self.dns_rewrites,
                 },
                 "proxy": {
                     "enabled": self.proxy_enabled,
@@ -461,7 +468,53 @@ class ConfigManager:
             self.dns_upstreams = cleaned or [dict(x) for x in default["upstreams"]]
         else:
             self.dns_upstreams = [dict(x) for x in default["upstreams"]]
-        logger.debug(f"已从配置文件加载 DNS 过滤器设置: 端口={self.dns_port} 上游={len(self.dns_upstreams)}")
+
+        strategy = str(cfg.get("strategy", default.get("strategy", "sequential")))
+        self.dns_strategy = strategy if strategy in ("sequential", "parallel") else "sequential"
+        for attr, key, lo, hi in (("dns_cache_min_ttl", "cache_min_ttl", 0, 86400),
+                                  ("dns_cache_max_ttl", "cache_max_ttl", 10, 604800)):
+            try:
+                setattr(self, attr, min(hi, max(lo, int(cfg.get(key, default.get(key, lo))))))
+            except (TypeError, ValueError):
+                setattr(self, attr, default.get(key, lo))
+        self.dns_log_enabled = bool(cfg.get("log_enabled", default.get("log_enabled", True)))
+
+        lists = cfg.get("lists")
+        cleaned_lists = []
+        if isinstance(lists, list):
+            for item in lists:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url", "")).strip()
+                if not url:
+                    continue
+                cleaned_lists.append({
+                    "name": str(item.get("name", "")).strip() or url,
+                    "url": url,
+                    "enabled": bool(item.get("enabled", True)),
+                    "interval": max(0, int(item.get("interval", 24) or 0)),
+                    "count": max(0, int(item.get("count", 0) or 0)),
+                    "updated": max(0, int(item.get("updated", 0) or 0)),
+                })
+        self.dns_lists = cleaned_lists
+
+        rules = cfg.get("custom_rules")
+        self.dns_custom_rules = [str(r).strip() for r in rules
+                                 if str(r).strip()] if isinstance(rules, list) else []
+
+        rewrites = cfg.get("rewrites")
+        clean_rw = {}
+        if isinstance(rewrites, dict):
+            for host, ip in rewrites.items():
+                host = str(host).strip().lower()
+                ip = str(ip).strip()
+                if host and ip:
+                    clean_rw[host] = ip
+        self.dns_rewrites = clean_rw
+
+        logger.debug(f"已从配置文件加载 DNS 过滤器设置: 端口={self.dns_port} 上游={len(self.dns_upstreams)} "
+                     f"列表={len(self.dns_lists)} 自定义规则={len(self.dns_custom_rules)} "
+                     f"重写={len(self.dns_rewrites)}")
 
     # ------------------------------------------------------------------
     # 网络加速（本地代理）
@@ -576,6 +629,13 @@ class ConfigManager:
             "block_action": "dns_block_action",
             "selected_upstream": "dns_selected_upstream",
             "upstreams": "dns_upstreams",
+            "strategy": "dns_strategy",
+            "cache_min_ttl": "dns_cache_min_ttl",
+            "cache_max_ttl": "dns_cache_max_ttl",
+            "log_enabled": "dns_log_enabled",
+            "lists": "dns_lists",
+            "custom_rules": "dns_custom_rules",
+            "rewrites": "dns_rewrites",
         }
         for key, value in kwargs.items():
             attr = mapping.get(key)

@@ -308,16 +308,81 @@ def _dedupe(nodes):
 
 def fetch_subscription(url, timeout=20):
     """拉取订阅文本；也支持本地文件路径，方便导入已有配置。"""
+    text, _meta = fetch_subscription_ex(url, timeout=timeout)
+    return text
+
+
+def parse_subscription_userinfo(value):
+    """解析订阅响应头 subscription-userinfo（Clash Verge 同款）。
+
+    形如：upload=123; download=456; total=107374182400; expire=1767225600
+    返回 {'upload','download','total','expire'}（缺省为 0）。
+    """
+    info = {"upload": 0, "download": 0, "total": 0, "expire": 0}
+    for part in str(value or "").split(";"):
+        key, _, val = part.partition("=")
+        key = key.strip().lower()
+        if key not in info:
+            continue
+        try:
+            info[key] = int(float(val.strip()))
+        except (TypeError, ValueError):
+            continue
+    return info
+
+
+def parse_subscription_headers(headers):
+    """从订阅响应头提取元信息：流量、到期、建议更新间隔、标题。"""
+    norm = {str(k).lower(): v for k, v in dict(headers or {}).items()}
+    meta = parse_subscription_userinfo(norm.get("subscription-userinfo", ""))
+    meta["info_present"] = bool(norm.get("subscription-userinfo"))
+    interval = norm.get("profile-update-interval", "")
+    try:
+        meta["interval"] = max(0, int(float(interval)))
+    except (TypeError, ValueError):
+        meta["interval"] = 0
+    title = ""
+    disposition = norm.get("content-disposition", "")
+    if "filename*=" in disposition:
+        title = disposition.split("filename*=", 1)[1].split(";")[0].strip()
+        if "''" in title:
+            title = title.split("''", 1)[1]
+        title = unquote(title)
+    elif 'filename="' in disposition:
+        title = disposition.split('filename="', 1)[1].split('"', 1)[0]
+    meta["title"] = title
+    return meta
+
+
+def format_traffic(byte_count):
+    """字节数转人类可读（Clash Verge 的流量显示口径）。"""
+    try:
+        value = float(byte_count or 0)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return "-"
+
+
+def fetch_subscription_ex(url, timeout=20):
+    """拉取订阅并返回 (文本, 元信息)。
+
+    元信息来自响应头：流量用量、到期时间、更新间隔、配置标题。
+    本地文件路径或 file:// 时元信息为空。
+    """
     url = (url or "").strip()
     if not url:
         raise ValueError("订阅地址为空")
     if url.startswith("file://"):
         path = url[7:]
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
+            return f.read(), {"local": True}
     if os.path.exists(url):
         with open(url, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
+            return f.read(), {"local": True}
 
     import requests
 
@@ -327,7 +392,9 @@ def fetch_subscription(url, timeout=20):
     }
     resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
     resp.raise_for_status()
-    return resp.text
+    meta = parse_subscription_headers(resp.headers)
+    meta["status"] = resp.status_code
+    return resp.text, meta
 
 
 # ----------------------------------------------------------------------
@@ -394,6 +461,8 @@ class NodeStore:
                 nodes.append(node)
                 index.setdefault(node.uid, node)
         for sub in self.subscriptions:
+            if not sub.get("enabled", True):
+                continue
             name = sub.get("name") or sub.get("url", "")
             for item in sub.get("nodes", []):
                 node = ProxyNode.from_dict(item)
@@ -414,16 +483,51 @@ class NodeStore:
     def subscription_names(self):
         return [s.get("name") or s.get("url", "") for s in self.subscriptions]
 
+    def subscription(self, name_or_url):
+        """按名称或地址取订阅条目（含 enabled / interval / meta）。"""
+        for sub in self.subscriptions:
+            if name_or_url in (sub.get("name"), sub.get("url")):
+                return sub
+        return None
+
+    def enabled_subscriptions(self):
+        return [s for s in self.subscriptions if s.get("enabled", True)]
+
+    def due_subscriptions(self, now=None):
+        """到更新时间的订阅列表（interval 单位：分钟，0 表示不自动更新）。"""
+        now = time.time() if now is None else now
+        due = []
+        for sub in self.subscriptions:
+            if not sub.get("enabled", True):
+                continue
+            interval = int(sub.get("interval", 0) or 0)
+            if interval <= 0:
+                continue
+            updated = int(sub.get("updated", 0) or 0)
+            if not updated or now - updated >= interval * 60:
+                due.append(sub)
+        return due
+
     # -- 修改 --------------------------------------------------------
-    def upsert_subscription(self, name, url, nodes):
+    def upsert_subscription(self, name, url, nodes, meta=None, error=""):
         entry = {
             "name": name or url,
             "url": url,
             "updated": int(time.time()),
             "nodes": [n.to_dict() for n in nodes],
+            "enabled": True,
+            "interval": 0,
+            "meta": dict(meta or {}),
+            "error": error or "",
         }
         for i, sub in enumerate(self.subscriptions):
             if sub.get("url") == url or (name and sub.get("name") == name):
+                # 保留用户设置：启用状态与更新间隔
+                entry["enabled"] = bool(sub.get("enabled", True))
+                entry["interval"] = int(sub.get("interval", 0) or 0)
+                if not meta and sub.get("meta"):
+                    entry["meta"] = dict(sub.get("meta"))
+                entry["error"] = error or ""
                 self.subscriptions[i] = entry
                 break
         else:
@@ -431,6 +535,46 @@ class NodeStore:
         self._invalidate()
         self.save()
         return len(nodes)
+
+    def update_subscription_meta(self, name_or_url, meta=None, error=""):
+        """只更新订阅的元信息/错误提示（不动节点列表）。"""
+        sub = self.subscription(name_or_url)
+        if sub is None:
+            return False
+        if meta:
+            sub["meta"] = dict(meta)
+        sub["error"] = error or ""
+        sub["checked"] = int(time.time())
+        self.save()
+        return True
+
+    def set_subscription_state(self, name_or_url, *, enabled=None, interval=None):
+        """切换订阅启用状态或自动更新间隔（分钟）。"""
+        sub = self.subscription(name_or_url)
+        if sub is None:
+            return False
+        if enabled is not None:
+            sub["enabled"] = bool(enabled)
+        if interval is not None:
+            sub["interval"] = max(0, int(interval))
+        self._invalidate()
+        self.save()
+        return True
+
+    def mark_updated(self, name_or_url, nodes=None, meta=None, error=""):
+        """记录一次成功/失败的更新结果。"""
+        sub = self.subscription(name_or_url)
+        if sub is None:
+            return False
+        sub["updated"] = int(time.time())
+        sub["error"] = error or ""
+        if meta:
+            sub["meta"] = dict(meta)
+        if nodes is not None:
+            sub["nodes"] = [n.to_dict() for n in nodes]
+            self._invalidate()
+        self.save()
+        return True
 
     def add_subscription(self, name, url):
         """只登记订阅不解析节点（mihomo 内核自己拉取）。"""

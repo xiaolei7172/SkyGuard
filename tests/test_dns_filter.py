@@ -52,7 +52,8 @@ class TestBlocklist(unittest.TestCase):
         f = DnsFilter(port=15353)
         f._apply_blocklists({"exact.com"}, {"ad.example.com"})
         self.assertEqual(f._match_block("exact.com"), "exact.com")
-        self.assertEqual(f._match_block("sub.ad.example.com"), "ad.example.com")
+        # 后缀命中返回 AdGuard 风格规则文本（便于日志/界面展示）
+        self.assertEqual(f._match_block("sub.ad.example.com"), "||ad.example.com^")
         self.assertEqual(f._match_block("ad.example.com"), "ad.example.com")
         # 仅仅是包含子串不算命中（例：evilad.example.org 不含 ad.example.com 父域）
         self.assertIsNone(f._match_block("notblocked.org"))

@@ -1,39 +1,61 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-DNS 过滤器页面
+"""DNS 过滤器页面（借鉴 AdGuard Home 的能力组织）
 
-本地 DNS 服务器管理：上游服务器（UDP/DoH/DoT）、黑名单拦截、
-系统 DNS 接管与恢复、查询统计。
+- 服务控制：启动 / 接管 / 恢复 / 停止
+- 上游服务器：UDP / DoH / DoT，支持顺序优先与并行最快两种策略
+- 查询日志：客户端 / 类型 / 结果 / 上游 / 耗时，可筛选、搜索、暂停
+- 统计：Top 客户端、Top 查询、Top 被拦截、查询类型分布
+- 过滤器：多份订阅列表 + 自定义规则（AdGuard 语法，支持 @@ 例外）
+- DNS 重写：域名直出指定 IP
 
-所有耗时操作（查询测试、延迟探测、订阅更新、接管恢复）都放线程，
+所有耗时操作（查询测试、延迟探测、列表更新、接管恢复）都放线程，
 通过信号回主线程更新界面。
 """
 
+import json
 import os
-import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
-    QFrame,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from core.dns_filter import DnsFilter, SUPPORTED_PROTOCOLS, Upstream, build_query, QTYPE_A
+from core import dns_lists
+from core.dns_filter import (
+    DnsFilter, QTYPE_A, SUPPORTED_PROTOCOLS, Upstream, build_query,
+)
 from ui.styles import StyleHelper
 from utils import dns_takeover
 from utils.logger import logger
 
 BLOCKLIST_SUBSCRIBE_URL = "https://anti-ad.net/hosts"
 
+RESULT_FILTERS = (
+    ("全部", "all"),
+    ("已拦截", "blocked"),
+    ("放行", "allow"),
+    ("缓存命中", "cached"),
+    ("重写", "rewrite"),
+    ("失败", "fail"),
+)
+
 
 def _blocklist_path():
     return os.path.join(os.path.expanduser("~"), ".skyguard", "dns-blocklist.txt")
+
+
+def _fmt_ts(ts):
+    if not ts:
+        return "从未更新"
+    import time
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts)))
 
 
 class DnsPage(QWidget):
@@ -59,11 +81,18 @@ class DnsPage(QWidget):
             [Upstream.from_dict(u) for u in config_manager.dns_upstreams],
             selected=config_manager.dns_selected_upstream,
         )
+        self.filter.upstream_strategy = config_manager.dns_strategy
+        self.filter.cache_min_ttl = config_manager.dns_cache_min_ttl
+        self.filter.cache_max_ttl = config_manager.dns_cache_max_ttl
+        self.filter.stats.query_log.paused = not config_manager.dns_log_enabled
+        self.filter.set_rewrites(config_manager.dns_rewrites)
 
         self._adapters = []
         self._probing = False
+        self._updating_lists = False
         self.ui_call.connect(lambda f: f())
         self.setup_ui()
+        self._rebuild_filter_rules()
 
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_stats)
@@ -72,6 +101,11 @@ class DnsPage(QWidget):
     def _ui(self, func):
         """线程安全地把界面更新投递回主线程。"""
         self.ui_call.emit(func)
+
+    def on_tab_changed(self, index):
+        """切到日志页时立即刷新一次，不等 2 秒轮询。"""
+        if index == 1:
+            self.refresh_log(force=True)
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -138,7 +172,30 @@ class DnsPage(QWidget):
         top_group.setLayout(top_box)
         layout.addWidget(top_group)
 
-        # --- 统计卡片行 ---
+        # --- 内嵌页签（对齐 AdGuard Home 的功能分区） ---
+        self.tabs = QTabWidget()
+        self.service_tab = self._build_service_tab()
+        self.log_tab = self._build_log_tab()
+        self.filter_tab = self._build_filter_tab()
+        self.tabs.addTab(self.service_tab, "  服务  ")
+        self.tabs.addTab(self.log_tab, "  查询日志  ")
+        self.tabs.addTab(self.filter_tab, "  过滤器与重写  ")
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        layout.addWidget(self.tabs)
+
+        self.refresh_adapters()
+        self.reload_upstream_table()
+        self.reload_list_table()
+        self.reload_rewrite_table()
+        self.refresh_stats()
+
+    # ---------------- 服务页 ----------------
+    def _build_service_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(10)
+
+        # 统计卡片行
         stats_row = QHBoxLayout()
         stats_row.setSpacing(10)
         self.stat_cards = {}
@@ -154,11 +211,9 @@ class DnsPage(QWidget):
             stats_row.addWidget(card, 1)
         layout.addLayout(stats_row)
 
-        # --- 主体两列 ---
         body = QHBoxLayout()
         body.setSpacing(10)
         layout.addLayout(body)
-
         left_col = QVBoxLayout()
         left_col.setSpacing(10)
         right_col = QVBoxLayout()
@@ -166,7 +221,7 @@ class DnsPage(QWidget):
         body.addLayout(left_col, 3)
         body.addLayout(right_col, 2)
 
-        # 左列：当前状态
+        # 当前状态
         state_group = QGroupBox("当前状态")
         state_layout = QVBoxLayout()
         self.state_label = QLabel("服务：未运行")
@@ -176,9 +231,37 @@ class DnsPage(QWidget):
         state_group.setLayout(state_layout)
         left_col.addWidget(state_group)
 
-        # 左列：上游服务器
+        # 上游服务器
         upstream_group = QGroupBox("上游服务器")
         upstream_layout = QVBoxLayout()
+
+        opt_row = QHBoxLayout()
+        opt_row.addWidget(QLabel("策略"))
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.addItem("顺序优先（失败再换下一个）", "sequential")
+        self.strategy_combo.addItem("并行最快（同时问，先回先用）", "parallel")
+        self.strategy_combo.setCurrentIndex(
+            1 if self.config_manager.dns_strategy == "parallel" else 0)
+        self.strategy_combo.currentIndexChanged.connect(self.on_strategy_changed)
+        opt_row.addWidget(self.strategy_combo, 1)
+
+        opt_row.addWidget(QLabel("缓存 TTL"))
+        self.min_ttl = QSpinBox()
+        self.min_ttl.setRange(0, 86400)
+        self.min_ttl.setValue(self.config_manager.dns_cache_min_ttl)
+        self.min_ttl.setSuffix(" 秒起")
+        self.min_ttl.setToolTip("上游返回的 TTL 小于此值时按此值缓存")
+        self.min_ttl.valueChanged.connect(self.on_ttl_changed)
+        opt_row.addWidget(self.min_ttl)
+
+        self.max_ttl = QSpinBox()
+        self.max_ttl.setRange(10, 604800)
+        self.max_ttl.setValue(self.config_manager.dns_cache_max_ttl)
+        self.max_ttl.setSuffix(" 秒封顶")
+        self.max_ttl.setToolTip("上游返回的 TTL 大于此值时按此值缓存")
+        self.max_ttl.valueChanged.connect(self.on_ttl_changed)
+        opt_row.addWidget(self.max_ttl)
+        upstream_layout.addLayout(opt_row)
 
         self.upstream_table = QTableWidget(0, 5)
         self.upstream_table.setHorizontalHeaderLabels(["名称", "协议", "地址", "状态", "延迟"])
@@ -187,17 +270,17 @@ class DnsPage(QWidget):
         self.upstream_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.upstream_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.upstream_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.upstream_table.setMinimumHeight(180)
+        self.upstream_table.setMinimumHeight(170)
         self.upstream_table.itemSelectionChanged.connect(self.on_upstream_selected)
         upstream_layout.addWidget(self.upstream_table)
 
         add_row = QHBoxLayout()
         self.new_name = QLineEdit()
-        self.new_name.setPlaceholderText("名称（可留空自动生成）")
+        self.new_name.setPlaceholderText("名称（可留空）")
         self.new_proto = QComboBox()
         self.new_proto.addItems(list(SUPPORTED_PROTOCOLS))
         self.new_addr = QLineEdit()
-        self.new_addr.setPlaceholderText("地址：223.5.5.5:53 / https://dns.alidns.com/dns-query / dot.pub:853")
+        self.new_addr.setPlaceholderText("地址：223.5.5.5:53 / https://dns.alidns.com/dns-query")
         add_btn = QPushButton("添加")
         add_btn.clicked.connect(self.on_add_upstream)
         add_row.addWidget(self.new_name, 1)
@@ -212,7 +295,7 @@ class DnsPage(QWidget):
         del_btn = QPushButton("删除选中")
         del_btn.clicked.connect(self.on_del_upstream)
         default_btn = QPushButton("设为默认")
-        default_btn.setToolTip("选中的上游将优先生效；失败时自动按列表顺序尝试其余上游")
+        default_btn.setToolTip("选中的上游优先使用；失败时按策略尝试其余上游")
         default_btn.clicked.connect(self.on_set_default_upstream)
         op_row.addWidget(probe_btn)
         op_row.addWidget(del_btn)
@@ -222,25 +305,13 @@ class DnsPage(QWidget):
 
         self.upstream_hint = QLabel("")
         self.upstream_hint.setStyleSheet("color: #8c8c8c;")
+        self.upstream_hint.setWordWrap(True)
         upstream_layout.addWidget(self.upstream_hint)
 
         upstream_group.setLayout(upstream_layout)
         left_col.addWidget(upstream_group, 1)
 
-        # 左列：最近被拦截
-        blocked_group = QGroupBox("最近被拦截的域名")
-        blocked_layout = QVBoxLayout()
-        self.blocked_table = QTableWidget(0, 2)
-        self.blocked_table.setHorizontalHeaderLabels(["域名", "命中规则"])
-        self.blocked_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.blocked_table.verticalHeader().setVisible(False)
-        self.blocked_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.blocked_table.setMinimumHeight(150)
-        blocked_layout.addWidget(self.blocked_table)
-        blocked_group.setLayout(blocked_layout)
-        left_col.addWidget(blocked_group, 1)
-
-        # 右列：系统 DNS 接管
+        # 系统 DNS 接管
         takeover_group = QGroupBox("系统 DNS 接管")
         takeover_layout = QVBoxLayout()
         tip = QLabel("勾选需要接管的网卡，程序会把它们的 DNS 指向本机。"
@@ -259,13 +330,12 @@ class DnsPage(QWidget):
         takeover_group.setLayout(takeover_layout)
         right_col.addWidget(takeover_group)
 
-        # 右列：维护
+        # 维护
         maint_group = QGroupBox("维护")
         maint_layout = QVBoxLayout()
         for text, slot in (
             ("清空 DNS 缓存", self.on_clear_cache),
-            ("重新加载黑名单", self.on_reload_blocklist),
-            ("更新订阅列表", self.on_subscribe),
+            ("重新加载规则", self.on_reload_blocklist),
             ("打开黑名单文件", self.on_open_blocklist),
             ("导出配置", self.on_export),
             ("导入配置", self.on_import),
@@ -279,10 +349,198 @@ class DnsPage(QWidget):
 
         right_col.addStretch()
         left_col.addStretch()
+        return page
 
-        self.refresh_adapters()
-        self.reload_upstream_table()
-        self.refresh_stats()
+    # ---------------- 查询日志页 ----------------
+    def _build_log_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(10)
+
+        tool_row = QHBoxLayout()
+        tool_row.setSpacing(8)
+        self.log_result = QComboBox()
+        for label, key in RESULT_FILTERS:
+            self.log_result.addItem(label, key)
+        self.log_result.currentIndexChanged.connect(lambda _i: self.refresh_log())
+        tool_row.addWidget(self.log_result)
+
+        self.log_search = QLineEdit()
+        self.log_search.setPlaceholderText("搜索域名或客户端 IP")
+        self.log_search.textChanged.connect(lambda _t: self.refresh_log())
+        tool_row.addWidget(self.log_search, 1)
+
+        self.log_pause = QCheckBox("暂停记录")
+        self.log_pause.setToolTip("暂停后新的查询不再写入日志，已有记录保留")
+        self.log_pause.setChecked(not self.config_manager.dns_log_enabled)
+        self.log_pause.toggled.connect(self.on_toggle_log_pause)
+        tool_row.addWidget(self.log_pause)
+
+        clear_btn = QPushButton("清空日志")
+        StyleHelper.set_button_type(clear_btn, "default")
+        clear_btn.clicked.connect(self.on_clear_log)
+        tool_row.addWidget(clear_btn)
+        layout.addLayout(tool_row)
+
+        self.log_table = QTableWidget(0, 6)
+        self.log_table.setHorizontalHeaderLabels(
+            ["时间", "客户端", "域名", "类型", "结果", "规则 / 上游"])
+        self.log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.log_table.verticalHeader().setVisible(False)
+        self.log_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.log_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.log_table.setMinimumHeight(240)
+        self.log_table.setToolTip("双击一行可把该域名加入自定义规则（拦截）")
+        self.log_table.doubleClicked.connect(lambda _i: self.on_log_to_rule())
+        layout.addWidget(self.log_table, 3)
+
+        stat_group = QGroupBox("统计（基于当前日志窗口）")
+        stat_layout = QVBoxLayout()
+        tables_row = QHBoxLayout()
+        tables_row.setSpacing(10)
+        self.top_client_table = self._mini_table("Top 客户端", "客户端")
+        self.top_domain_table = self._mini_table("Top 查询域名", "域名")
+        self.top_blocked_table = self._mini_table("Top 被拦截", "域名")
+        for t in (self.top_client_table, self.top_domain_table, self.top_blocked_table):
+            tables_row.addWidget(t, 1)
+        stat_layout.addLayout(tables_row)
+
+        self.type_label = QLabel("暂无数据")
+        self.type_label.setWordWrap(True)
+        self.type_label.setStyleSheet("color: #595959;")
+        stat_layout.addWidget(self.type_label)
+        stat_group.setLayout(stat_layout)
+        layout.addWidget(stat_group, 2)
+        return page
+
+    def _mini_table(self, title, first_col):
+        group = QGroupBox(title)
+        box = QVBoxLayout()
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels([first_col, "次数"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setMinimumHeight(140)
+        box.addWidget(table)
+        group.setLayout(box)
+        group._table = table
+        return group
+
+    # ---------------- 过滤器与重写页 ----------------
+    def _build_filter_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(10)
+
+        list_group = QGroupBox("过滤器列表")
+        list_layout = QVBoxLayout()
+        tip = QLabel("列表按勾选启用，规则与自定义规则一起生效；"
+                     "配置里只存地址与统计，规则内容缓存在本地，离线也能用。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #8c8c8c;")
+        list_layout.addWidget(tip)
+
+        self.list_table = QTableWidget(0, 4)
+        self.list_table.setHorizontalHeaderLabels(["启用", "名称", "规则数", "更新于"])
+        self.list_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.list_table.verticalHeader().setVisible(False)
+        self.list_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.list_table.setMinimumHeight(150)
+        self.list_table.itemChanged.connect(self.on_list_item_changed)
+        list_layout.addWidget(self.list_table)
+
+        add_row = QHBoxLayout()
+        self.list_name = QLineEdit()
+        self.list_name.setPlaceholderText("名称（可空）")
+        self.list_url = QLineEdit()
+        self.list_url.setPlaceholderText("列表地址，如 https://anti-ad.net/adguard.txt")
+        self.list_interval = QSpinBox()
+        self.list_interval.setRange(0, 720)
+        self.list_interval.setValue(24)
+        self.list_interval.setSuffix(" 小时更新")
+        self.list_interval.setToolTip("0 表示不自动更新")
+        add_btn = QPushButton("添加")
+        add_btn.clicked.connect(self.on_add_list)
+        add_row.addWidget(self.list_name, 1)
+        add_row.addWidget(self.list_url, 3)
+        add_row.addWidget(self.list_interval)
+        add_row.addWidget(add_btn)
+        list_layout.addLayout(add_row)
+
+        op_row = QHBoxLayout()
+        update_btn = QPushButton("更新选中")
+        update_btn.clicked.connect(lambda: self.on_update_lists(only_selected=True))
+        update_all_btn = QPushButton("更新全部")
+        update_all_btn.clicked.connect(lambda: self.on_update_lists(only_selected=False))
+        del_btn = QPushButton("删除选中")
+        StyleHelper.set_button_type(del_btn, "default")
+        del_btn.clicked.connect(self.on_del_list)
+        op_row.addWidget(update_btn)
+        op_row.addWidget(update_all_btn)
+        op_row.addWidget(del_btn)
+        op_row.addStretch()
+        list_layout.addLayout(op_row)
+
+        self.list_hint = QLabel("")
+        self.list_hint.setStyleSheet("color: #8c8c8c;")
+        self.list_hint.setWordWrap(True)
+        list_layout.addWidget(self.list_hint)
+        list_group.setLayout(list_layout)
+
+        custom_group = QGroupBox("自定义规则")
+        custom_layout = QVBoxLayout()
+        self.custom_summary = QLabel("0 条")
+        self.custom_summary.setStyleSheet("color: #8c8c8c;")
+        custom_layout.addWidget(self.custom_summary)
+        custom_row = QHBoxLayout()
+        edit_btn = QPushButton("编辑规则")
+        edit_btn.clicked.connect(self.on_edit_custom_rules)
+        hint = QLabel("支持：||ads.com^ 拦截、@@||ok.ads.com^ 例外、*.ads.com 通配、/正则/")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8c8c8c;")
+        custom_row.addWidget(edit_btn)
+        custom_row.addWidget(hint, 1)
+        custom_layout.addLayout(custom_row)
+        custom_group.setLayout(custom_layout)
+
+        rewrite_group = QGroupBox("DNS 重写")
+        rewrite_layout = QVBoxLayout()
+        rewrite_tip = QLabel("把域名直接解析到指定 IP（如 nas.home → 192.168.1.10），"
+                             "优先于上游解析；支持 *.lan 通配。")
+        rewrite_tip.setWordWrap(True)
+        rewrite_tip.setStyleSheet("color: #8c8c8c;")
+        rewrite_layout.addWidget(rewrite_tip)
+
+        self.rewrite_table = QTableWidget(0, 2)
+        self.rewrite_table.setHorizontalHeaderLabels(["域名", "IP"])
+        self.rewrite_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.rewrite_table.verticalHeader().setVisible(False)
+        self.rewrite_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rewrite_table.setMinimumHeight(130)
+        rewrite_layout.addWidget(self.rewrite_table)
+
+        rw_row = QHBoxLayout()
+        self.rw_domain = QLineEdit()
+        self.rw_domain.setPlaceholderText("域名，如 nas.home 或 *.lan")
+        self.rw_ip = QLineEdit()
+        self.rw_ip.setPlaceholderText("IP，如 192.168.1.10")
+        rw_add = QPushButton("添加")
+        rw_add.clicked.connect(self.on_add_rewrite)
+        rw_del = QPushButton("删除选中")
+        StyleHelper.set_button_type(rw_del, "default")
+        rw_del.clicked.connect(self.on_del_rewrite)
+        rw_row.addWidget(self.rw_domain, 2)
+        rw_row.addWidget(self.rw_ip, 2)
+        rw_row.addWidget(rw_add)
+        rw_row.addWidget(rw_del)
+        rewrite_layout.addLayout(rw_row)
+        rewrite_group.setLayout(rewrite_layout)
+
+        layout.addWidget(list_group, 2)
+        layout.addWidget(custom_group)
+        layout.addWidget(rewrite_group, 2)
+        return page
 
     # ------------------------------------------------------------------
     # 服务控制
@@ -303,7 +561,8 @@ class DnsPage(QWidget):
             with open(self.blocklist_path, "w", encoding="utf-8") as f:
                 f.write("# SkyGuard DNS 黑名单（每行一个域名，拦截该域及其全部子域）\n")
                 f.write("# 支持 hosts 格式（0.0.0.0 domain）；# 开头为注释\n")
-                f.write("\n".join(sorted({d.strip().rstrip('.') for d in DEFAULT_BLOCKLIST if '*' not in d and '/' not in d})) + "\n")
+                f.write("\n".join(sorted({d.strip().rstrip('.') for d in DEFAULT_BLOCKLIST
+                                          if '*' not in d and '/' not in d})) + "\n")
         except Exception as e:
             logger.warning(f"初始化 DNS 黑名单文件失败: {e}")
 
@@ -312,9 +571,23 @@ class DnsPage(QWidget):
             [Upstream.from_dict(u) for u in self.config_manager.dns_upstreams],
             selected=self.config_manager.dns_selected_upstream,
         )
+        self.filter.upstream_strategy = self.config_manager.dns_strategy
+        self.filter.cache_min_ttl = self.config_manager.dns_cache_min_ttl
+        self.filter.cache_max_ttl = self.config_manager.dns_cache_max_ttl
+        self.filter.set_rewrites(self.config_manager.dns_rewrites)
+
+    def _rebuild_filter_rules(self):
+        """把「过滤器列表缓存 + 自定义规则」编译进过滤器。"""
+        lines, counts = dns_lists.merged_rules(self.config_manager.dns_lists)
+        rules = self.filter.set_filter_sources(lines, self.config_manager.dns_custom_rules)
+        self.custom_summary.setText(
+            f"自定义规则 {len(self.config_manager.dns_custom_rules)} 条 · "
+            f"合计生效 {rules.count} 条（含例外 {rules.allow_count}）")
+        return rules
 
     def _start_service(self):
         self._sync_upstreams_to_filter()
+        self._rebuild_filter_rules()
         self.filter.port = self.config_manager.dns_port
         self.filter.block_action = self.config_manager.dns_block_action
         ok = self.filter.start()
@@ -374,6 +647,18 @@ class DnsPage(QWidget):
     # ------------------------------------------------------------------
     # 上游管理
     # ------------------------------------------------------------------
+    def on_strategy_changed(self, _index):
+        strategy = self.strategy_combo.currentData()
+        self.config_manager.set_dns_config(strategy=strategy)
+        self.filter.upstream_strategy = strategy
+
+    def on_ttl_changed(self, _value):
+        self.config_manager.set_dns_config(
+            cache_min_ttl=self.min_ttl.value(),
+            cache_max_ttl=max(self.min_ttl.value() + 10, self.max_ttl.value()))
+        self.filter.cache_min_ttl = self.config_manager.dns_cache_min_ttl
+        self.filter.cache_max_ttl = self.config_manager.dns_cache_max_ttl
+
     def reload_upstream_table(self):
         ups = self.config_manager.dns_upstreams
         self.upstream_table.setRowCount(len(ups))
@@ -386,10 +671,10 @@ class DnsPage(QWidget):
             self.upstream_table.setItem(row, 4, QTableWidgetItem("—"))
             if row == self.config_manager.dns_selected_upstream:
                 for col in range(5):
-                    self.upstream_table.item(row, col).setBackground(Qt.GlobalColor.transparent)
-                    font = self.upstream_table.item(row, col).font()
+                    item = self.upstream_table.item(row, col)
+                    font = item.font()
                     font.setBold(True)
-                    self.upstream_table.item(row, col).setFont(font)
+                    item.setFont(font)
         self._update_selected_hint()
 
     def on_upstream_selected(self):
@@ -409,7 +694,8 @@ class DnsPage(QWidget):
             QMessageBox.information(self, "添加上游", "请填写地址。")
             return
         if proto == "DoH" and not addr.lower().startswith(("http://", "https://")):
-            QMessageBox.information(self, "添加上游", "DoH 地址必须是完整 URL，例如 https://dns.alidns.com/dns-query")
+            QMessageBox.information(self, "添加上游",
+                                    "DoH 地址必须是完整 URL，例如 https://dns.alidns.com/dns-query")
             return
         ups = self.config_manager.dns_upstreams
         ups.append({"name": name or f"{proto}-{addr}", "proto": proto, "address": addr})
@@ -470,6 +756,265 @@ class DnsPage(QWidget):
         self.upstream_hint.setText("延迟测试完成")
 
     # ------------------------------------------------------------------
+    # 查询日志 / 统计
+    # ------------------------------------------------------------------
+    def refresh_log(self, force=False):
+        if not self.isVisible():
+            return
+        # 日志表只在「查询日志」页可见时刷新，避免无谓的表格重绘
+        if not force and getattr(self, "log_tab", None) is not None \
+                and self.tabs.currentWidget() is not self.log_tab:
+            return
+        log = self.filter.stats.query_log
+        result = self.log_result.currentData() or "all"
+        rows = log.snapshot(result=result, search=self.log_search.text(), limit=200)
+        self.log_table.setRowCount(len(rows))
+        for r, e in enumerate(rows):
+            cells = [e["time"], e["client"], e["domain"], e["qtype"],
+                     e["result_label"], e["rule"] or e["upstream"] or "-"]
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(str(text))
+                if e["result"] == "blocked":
+                    item.setForeground(Qt.GlobalColor.darkRed)
+                elif e["result"] == "cached":
+                    item.setForeground(Qt.GlobalColor.darkGray)
+                self.log_table.setItem(r, c, item)
+
+        agg = log.aggregates(top_n=8)
+        self._fill_mini(self.top_client_table, agg["top_clients"])
+        self._fill_mini(self.top_domain_table, agg["top_domains"])
+        self._fill_mini(self.top_blocked_table, agg["top_blocked"])
+        self.type_label.setText(self._type_bar(agg["by_type"]))
+
+    def _fill_mini(self, group, pairs):
+        table = group._table
+        table.setRowCount(len(pairs))
+        for r, (name, count) in enumerate(pairs):
+            table.setItem(r, 0, QTableWidgetItem(str(name)))
+            table.setItem(r, 1, QTableWidgetItem(str(count)))
+
+    @staticmethod
+    def _type_bar(pairs):
+        if not pairs:
+            return "暂无数据"
+        total = sum(c for _, c in pairs) or 1
+        lines = []
+        for name, count in pairs:
+            ratio = count * 100 / total
+            bar = "█" * max(1, int(round(ratio / 5)))
+            lines.append(f"{name:<6} {ratio:5.1f}%  {bar}  ({count})")
+        return "查询类型分布：\n" + "   ".join(lines[:6])
+
+    def on_toggle_log_pause(self, paused):
+        self.filter.stats.query_log.paused = bool(paused)
+        self.config_manager.set_dns_config(log_enabled=not paused)
+        self.refresh_log()
+
+    def on_clear_log(self):
+        self.filter.stats.query_log.clear()
+        self.refresh_log()
+
+    def on_log_to_rule(self):
+        row = self.log_table.currentRow()
+        if row < 0:
+            return
+        item = self.log_table.item(row, 2)
+        if item is None:
+            return
+        domain = item.text().strip()
+        if not domain:
+            return
+        if QMessageBox.question(
+                self, "加入自定义规则",
+                f"把 {domain} 加入自定义拦截规则？\n（会写入自定义规则列表并立即生效）") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        rules = list(self.config_manager.dns_custom_rules)
+        rule = f"||{domain}^"
+        if rule not in rules:
+            rules.append(rule)
+            self.config_manager.set_dns_config(custom_rules=rules)
+            self._rebuild_filter_rules()
+
+    # ------------------------------------------------------------------
+    # 过滤器列表
+    # ------------------------------------------------------------------
+    def reload_list_table(self):
+        entries = self.config_manager.dns_lists
+        if not entries:
+            entries = [dict(e) for e in dns_lists.DEFAULT_LISTS]
+            self.config_manager.set_dns_config(lists=entries)
+            self.config_manager.dns_lists = entries
+        self.list_table.blockSignals(True)
+        self.list_table.setRowCount(len(entries))
+        for row, e in enumerate(entries):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            chk.setCheckState(Qt.CheckState.Checked if e.get("enabled", True)
+                              else Qt.CheckState.Unchecked)
+            self.list_table.setItem(row, 0, chk)
+            self.list_table.setItem(row, 1, QTableWidgetItem(e.get("name") or e.get("url", "")))
+            self.list_table.setItem(row, 2, QTableWidgetItem(str(e.get("count", 0))))
+            self.list_table.setItem(row, 3, QTableWidgetItem(_fmt_ts(e.get("updated", 0))))
+        self.list_table.blockSignals(False)
+
+    def on_list_item_changed(self, item):
+        if item.column() != 0:
+            return
+        row = item.row()
+        entries = self.config_manager.dns_lists
+        if row >= len(entries):
+            return
+        entries[row]["enabled"] = item.checkState() == Qt.CheckState.Checked
+        self.config_manager.set_dns_config(lists=entries)
+        rules = self._rebuild_filter_rules()
+        self.list_hint.setText(f"已应用，当前生效规则 {rules.count} 条")
+
+    def on_add_list(self):
+        url = self.list_url.text().strip()
+        if not url:
+            QMessageBox.information(self, "添加列表", "请填写列表地址。")
+            return
+        entry = {
+            "name": self.list_name.text().strip() or url,
+            "url": url,
+            "enabled": True,
+            "interval": self.list_interval.value(),
+            "count": 0,
+            "updated": 0,
+        }
+        entries = list(self.config_manager.dns_lists) + [entry]
+        self.config_manager.set_dns_config(lists=entries)
+        self.config_manager.dns_lists = entries
+        self.list_name.clear()
+        self.list_url.clear()
+        self.reload_list_table()
+        self.on_update_lists(only_selected=False, targets=[entry])
+
+    def on_del_list(self):
+        row = self.list_table.currentRow()
+        entries = self.config_manager.dns_lists
+        if row < 0 or row >= len(entries):
+            return
+        entries.pop(row)
+        self.config_manager.set_dns_config(lists=entries)
+        self.reload_list_table()
+        self._rebuild_filter_rules()
+
+    def on_update_lists(self, only_selected=False, targets=None):
+        if self._updating_lists:
+            return
+        entries = self.config_manager.dns_lists
+        if targets is not None:
+            todo = targets
+        elif only_selected:
+            row = self.list_table.currentRow()
+            if row < 0 or row >= len(entries):
+                QMessageBox.information(self, "更新列表", "请先选中一行。")
+                return
+            todo = [entries[row]]
+        else:
+            todo = [e for e in entries if e.get("enabled", True)]
+        if not todo:
+            QMessageBox.information(self, "更新列表", "没有启用的列表可更新。")
+            return
+
+        self._updating_lists = True
+        self.list_hint.setText(f"正在更新 {len(todo)} 个列表…")
+
+        def work():
+            results = []
+            for e in todo:
+                count, err = dns_lists.update_list(e)
+                results.append((e.get("name") or e.get("url"), count, err))
+            self._ui(lambda: self._after_update_lists(results))
+        threading_run(work)
+
+    def _after_update_lists(self, results):
+        self._updating_lists = False
+        self.config_manager.set_dns_config(lists=self.config_manager.dns_lists)
+        self.reload_list_table()
+        rules = self._rebuild_filter_rules()
+        ok = [f"{n}（{c} 条）" for n, c, err in results if not err]
+        bad = [f"{n}：{err}" for n, c, err in results if err]
+        parts = []
+        if ok:
+            parts.append("更新成功：" + "、".join(ok))
+        if bad:
+            parts.append("失败：" + "；".join(bad))
+        parts.append(f"当前生效 {rules.count} 条")
+        self.list_hint.setText("；".join(parts))
+
+    # ------------------------------------------------------------------
+    # 自定义规则 / 重写
+    # ------------------------------------------------------------------
+    def on_edit_custom_rules(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("自定义过滤规则")
+        dlg.resize(560, 420)
+        box = QVBoxLayout(dlg)
+        tip = QLabel("一行一条。||ads.com^ 拦截该域及子域；@@||ok.ads.com^ 放行；"
+                     "*.ads.com 通配；/正则/ 正则匹配；# 与 ! 开头为注释。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #8c8c8c;")
+        box.addWidget(tip)
+        editor = QPlainTextEdit()
+        editor.setPlainText("\n".join(self.config_manager.dns_custom_rules))
+        editor.setPlaceholderText("||ads.example.com^\n@@||cdn.example.com^")
+        box.addWidget(editor, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        box.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        rules = [ln.strip() for ln in editor.toPlainText().splitlines() if ln.strip()]
+        self.config_manager.set_dns_config(custom_rules=rules)
+        applied = self._rebuild_filter_rules()
+        self.list_hint.setText(f"自定义规则已保存，当前生效 {applied.count} 条")
+
+    def reload_rewrite_table(self):
+        rw = self.config_manager.dns_rewrites
+        self.rewrite_table.setRowCount(len(rw))
+        for row, (domain, ip) in enumerate(sorted(rw.items())):
+            self.rewrite_table.setItem(row, 0, QTableWidgetItem(domain))
+            self.rewrite_table.setItem(row, 1, QTableWidgetItem(ip))
+
+    def on_add_rewrite(self):
+        domain = self.rw_domain.text().strip().lower()
+        ip = self.rw_ip.text().strip()
+        if not domain or not ip:
+            QMessageBox.information(self, "DNS 重写", "请填写域名和 IP。")
+            return
+        from core.dns_filter import ip_to_rdata
+        if not ip_to_rdata(ip):
+            QMessageBox.warning(self, "DNS 重写", f"{ip} 不是合法的 IPv4 / IPv6 地址。")
+            return
+        rw = dict(self.config_manager.dns_rewrites)
+        rw[domain] = ip
+        self.config_manager.set_dns_config(rewrites=rw)
+        self.config_manager.dns_rewrites = rw
+        self.filter.set_rewrites(rw)
+        self.rw_domain.clear()
+        self.rw_ip.clear()
+        self.reload_rewrite_table()
+
+    def on_del_rewrite(self):
+        row = self.rewrite_table.currentRow()
+        if row < 0:
+            return
+        item = self.rewrite_table.item(row, 0)
+        if item is None:
+            return
+        rw = dict(self.config_manager.dns_rewrites)
+        rw.pop(item.text(), None)
+        self.config_manager.set_dns_config(rewrites=rw)
+        self.config_manager.dns_rewrites = rw
+        self.filter.set_rewrites(rw)
+        self.reload_rewrite_table()
+
+    # ------------------------------------------------------------------
     # 网卡
     # ------------------------------------------------------------------
     def refresh_adapters(self):
@@ -507,30 +1052,13 @@ class DnsPage(QWidget):
     # 维护
     # ------------------------------------------------------------------
     def on_clear_cache(self):
-        with self.filter._cache_lock:
-            self.filter._cache.clear()
+        self.filter.clear_cache()
         self.filter.stats.reset()
-        QMessageBox.information(self, "维护", "DNS 缓存与统计已清空。")
+        QMessageBox.information(self, "维护", "DNS 缓存、统计与查询日志已清空。")
 
     def on_reload_blocklist(self):
-        self.filter.reload_blocklist()
-        count = len(self.filter._suffix) + len(self.filter._exact)
-        QMessageBox.information(self, "维护", f"黑名单已重新加载：{count} 条规则。")
-
-    def on_subscribe(self):
-        self.upstream_hint.setText("正在更新订阅列表…")
-
-        def work():
-            count, err = self.filter.update_subscription(BLOCKLIST_SUBSCRIBE_URL)
-            self._ui(lambda: self._after_subscribe(count, err))
-        threading_run(work)
-
-    def _after_subscribe(self, count, err):
-        if err:
-            QMessageBox.warning(self, "更新订阅", f"更新失败：{err}")
-        else:
-            QMessageBox.information(self, "更新订阅", f"订阅更新完成，共 {count} 条规则。")
-        self.upstream_hint.setText("")
+        applied = self._rebuild_filter_rules()
+        QMessageBox.information(self, "维护", f"规则已重新加载：{applied.count} 条生效。")
 
     def on_open_blocklist(self):
         try:
@@ -542,10 +1070,12 @@ class DnsPage(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "导出 DNS 配置", "dns-config.json", "JSON (*.json)")
         if not path:
             return
-        import json
         try:
+            data = self.filter.export_config()
+            data["lists"] = self.config_manager.dns_lists
+            data["custom_rules"] = self.config_manager.dns_custom_rules
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.filter.export_config(), f, ensure_ascii=False, indent=2)
+                json.dump(data, f, ensure_ascii=False, indent=2)
             QMessageBox.information(self, "导出配置", "导出完成。")
         except Exception as e:
             QMessageBox.warning(self, "导出配置", f"导出失败：{e}")
@@ -554,25 +1084,34 @@ class DnsPage(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "导入 DNS 配置", "", "JSON (*.json)")
         if not path:
             return
-        import json
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             ups = [Upstream.from_dict(d).to_dict() for d in data.get("upstreams", [])]
             if not ups:
                 raise ValueError("配置中没有上游服务器")
-            self.config_manager.set_dns_config(
+            kwargs = dict(
                 upstreams=ups,
                 selected_upstream=int(data.get("selected", 0)),
                 port=int(data.get("port", self.config_manager.dns_port)),
                 block_action=data.get("block_action", self.config_manager.dns_block_action),
             )
+            if data.get("strategy") in ("sequential", "parallel"):
+                kwargs["strategy"] = data["strategy"]
+            if isinstance(data.get("rewrites"), dict):
+                kwargs["rewrites"] = data["rewrites"]
+            if isinstance(data.get("custom_rules"), list):
+                kwargs["custom_rules"] = [str(r) for r in data["custom_rules"]]
+            if isinstance(data.get("lists"), list):
+                kwargs["lists"] = data["lists"]
+            self.config_manager.set_dns_config(**kwargs)
             self.reload_upstream_table()
+            self.reload_list_table()
+            self.reload_rewrite_table()
+            self._rebuild_filter_rules()
             self.listen_label.setText(
                 f"监听 {'、'.join(self._listen_hosts())} :: 端口 {self.config_manager.dns_port}")
             if self.filter.running:
-                self.filter.port = self.config_manager.dns_port
-                self.filter.block_action = self.config_manager.dns_block_action
                 self._sync_upstreams_to_filter()
             QMessageBox.information(self, "导入配置", "导入完成，重启服务后端口变更生效。")
         except Exception as e:
@@ -598,13 +1137,7 @@ class DnsPage(QWidget):
                 latency = f"{slot['latency_ms']:.0f} ms"
         self.stat_cards["latency"].setText(latency)
 
-        # 最近被拦截
-        rows = snap["blocked_log"][:50]
-        self.blocked_table.setRowCount(len(rows))
-        for r, entry in enumerate(rows):
-            self.blocked_table.setItem(r, 0, QTableWidgetItem(entry["domain"]))
-            self.blocked_table.setItem(r, 1, QTableWidgetItem(f"{entry['rule']}（{entry['action']}）"))
-
+        self.refresh_log()
         self._update_state()
 
     def _update_state(self):
@@ -621,10 +1154,15 @@ class DnsPage(QWidget):
             backup = dns_takeover._load_backup()
             if backup:
                 dns_state = "已接管 · 本机 DNS 指向 127.0.0.1 / ::1"
+        rules = self.filter.rules
         lines = [
             f"<b>服务：</b>{'运行中' if running else '未运行'} · 端口 {self.filter.port}"
-            + (f"（监听失败：{'; '.join(self.filter.bind_errors)}）" if running and self.filter.bind_errors else ""),
+            + (f"（监听失败：{'; '.join(self.filter.bind_errors)}）"
+               if running and self.filter.bind_errors else ""),
             f"<b>线路：</b>{sel.name + '（' + sel.proto + '）' if sel else '未配置上游'}",
+            f"<b>策略：</b>{'并行最快' if self.filter.upstream_strategy == 'parallel' else '顺序优先'}",
+            f"<b>规则：</b>{rules.count} 条（例外 {rules.allow_count}）· "
+            f"重写 {len(self.filter.rewrites)} 条",
             f"<b>系统 DNS：</b>{dns_state}",
         ]
         self.state_label.setText("<br>".join(lines))
@@ -633,7 +1171,8 @@ class DnsPage(QWidget):
         color = "#52c41a" if running else "#8c8c8c"
         bg = "#f6ffed" if running else "#f5f5f5"
         self.status_pill.setStyleSheet(
-            f"color: {color}; background-color: {bg}; border-radius: 4px; padding: 2px 8px; font-weight: 600;")
+            f"color: {color}; background-color: {bg}; border-radius: 4px; "
+            f"padding: 2px 8px; font-weight: 600;")
 
     def shutdown(self):
         """主窗口退出时调用：恢复系统 DNS 并停止服务。"""

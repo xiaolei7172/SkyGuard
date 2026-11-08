@@ -1,14 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-DNS 过滤器核心
+"""DNS 过滤器核心（借鉴 AdGuard Home 的能力组合）。
 
 本地 DNS 服务器（UDP + TCP）：
-  - 上游支持 UDP / DoH / DoT 三种协议
-  - 应答缓存（按 TTL 过期，命中后逐条递减 TTL 回写）
-  - 黑名单拦截：A 记录返回 0.0.0.0，AAAA 返回 ::，其余类型返回 NXDOMAIN
-  - 线程安全的统计计数与查询日志（供界面轮询展示）
+  - 上游支持 UDP / DoH / DoT 三种协议，可选「并行最快」或「顺序优先」策略
+  - 应答缓存（按 TTL 过期，命中后逐条递减 TTL 回写；TTL 可设上下限）
+  - 过滤规则：内置兜底 + 过滤器列表 + 自定义规则（@/@@ 例外、通配、正则）
+  - DNS 重写：域名直出指定 IP（如把局域网服务改成短域名）
+  - 查询日志：客户端 / 类型 / 结果 / 上游 / 耗时，供界面筛选与统计
+  - 线程安全的统计计数与 Top 聚合
 
 只依赖标准库 + requests（DoH），不引入额外打包依赖。
 """
@@ -21,20 +22,30 @@ import ssl
 import struct
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 
 import requests
 
+from core.dns_rules import RuleSet, compile_rules
 from utils.logger import logger
 
 # 常用记录类型
 QTYPE_A = 1
 QTYPE_AAAA = 28
 
+QTYPE_NAMES = {
+    1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT",
+    28: "AAAA", 33: "SRV", 35: "NAPTR", 43: "DS", 46: "RRSIG", 48: "DNSKEY",
+    52: "TLSA", 64: "SVCB", 65: "HTTPS", 255: "ANY",
+}
+
 PROTO_UDP = "UDP"
 PROTO_DOH = "DoH"
 PROTO_DOT = "DoT"
 SUPPORTED_PROTOCOLS = (PROTO_UDP, PROTO_DOH, PROTO_DOT)
+
+STRATEGY_SEQUENTIAL = "sequential"
+STRATEGY_PARALLEL = "parallel"
 
 DEFAULT_BLOCKLIST = [
     # 出厂自带的兜底黑名单（少量高频广告域），完整规则可通过「更新订阅」拉取
@@ -63,6 +74,23 @@ def is_blocked_domain(domain, exact_set, suffix_set):
         if domain[idx + 1:] in suffix_set:
             return True
         idx += 1
+
+
+def qtype_name(qtype):
+    return QTYPE_NAMES.get(int(qtype or 0), str(qtype))
+
+
+def ip_to_rdata(text):
+    """把 IPv4 / IPv6 文本转成应答 rdata；失败返回 None。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        if ":" in text:
+            return (QTYPE_AAAA, socket.inet_pton(socket.AF_INET6, text))
+        return (QTYPE_A, socket.inet_pton(socket.AF_INET, text))
+    except OSError:
+        return None
 
 
 class Upstream:
@@ -188,6 +216,103 @@ def build_query(domain, qtype=QTYPE_A, query_id=0x0000):
     return header + qname + struct.pack(">HH", qtype, 1)
 
 
+# ----------------------------------------------------------------------
+# 查询日志（AdGuard Home 的 Query Log）
+# ----------------------------------------------------------------------
+RESULT_ALLOW = "allow"
+RESULT_BLOCKED = "blocked"
+RESULT_CACHED = "cached"
+RESULT_REWRITE = "rewrite"
+RESULT_FAIL = "fail"
+
+RESULT_LABELS = {
+    RESULT_ALLOW: "放行",
+    RESULT_BLOCKED: "已拦截",
+    RESULT_CACHED: "缓存命中",
+    RESULT_REWRITE: "重写",
+    RESULT_FAIL: "失败",
+}
+
+
+class QueryLog:
+    """环形查询日志 + 即时 Top 聚合。总量有上限，长时间运行也不会涨内存。"""
+
+    def __init__(self, size=800):
+        self._lock = threading.Lock()
+        self._items = deque(maxlen=max(50, int(size)))
+        self.paused = False
+        self.dropped = 0
+
+    def add(self, client, domain, qtype, result, rule="", upstream="", ms=0.0):
+        if self.paused:
+            self.dropped += 1
+            return
+        entry = {
+            "ts": time.time(),
+            "time": time.strftime("%H:%M:%S"),
+            "client": client or "-",
+            "domain": domain,
+            "qtype": qtype_name(qtype),
+            "result": result,
+            "result_label": RESULT_LABELS.get(result, result),
+            "rule": rule,
+            "upstream": upstream,
+            "ms": round(float(ms or 0), 1),
+        }
+        with self._lock:
+            self._items.appendleft(entry)
+
+    def snapshot(self, result="all", search="", limit=200):
+        """按结果类型与关键字筛选，返回最近的若干条（新的在前）。"""
+        search = (search or "").strip().lower()
+        out = []
+        with self._lock:
+            items = list(self._items)
+        for e in items:
+            if result != "all" and e["result"] != result:
+                continue
+            if search and search not in e["domain"].lower() and search not in e["client"].lower():
+                continue
+            out.append(e)
+            if len(out) >= limit:
+                break
+        return out
+
+    def aggregates(self, top_n=6):
+        """Top 客户端 / 域名 / 被拦截域名 / 查询类型 / 24 小时分布。"""
+        with self._lock:
+            items = list(self._items)
+        clients = Counter()
+        domains = Counter()
+        blocked = Counter()
+        types = Counter()
+        hourly = Counter()
+        for e in items:
+            clients[e["client"]] += 1
+            domains[e["domain"]] += 1
+            types[e["qtype"]] += 1
+            if e["result"] == RESULT_BLOCKED:
+                blocked[e["domain"]] += 1
+            hourly[time.localtime(e["ts"]).tm_hour] += 1
+        return {
+            "size": len(items),
+            "top_clients": clients.most_common(top_n),
+            "top_domains": domains.most_common(top_n),
+            "top_blocked": blocked.most_common(top_n),
+            "by_type": types.most_common(top_n),
+            "hourly": [(h, hourly.get(h, 0)) for h in range(24)],
+        }
+
+    def clear(self):
+        with self._lock:
+            self._items.clear()
+
+    @property
+    def size(self):
+        with self._lock:
+            return len(self._items)
+
+
 class DnsStats:
     """线程安全统计。"""
 
@@ -197,8 +322,10 @@ class DnsStats:
         self.blocked = 0
         self.cache_hits = 0
         self.failed = 0
+        self.rewrites = 0
         self.upstreams = {}   # name -> {"ok": n, "fail": n, "latency_ms": float|None}
         self.log = deque(maxlen=log_size)  # 最近被拦截的域名
+        self.query_log = QueryLog()
 
     def count_query(self):
         with self._lock:
@@ -218,6 +345,10 @@ class DnsStats:
         with self._lock:
             self.failed += 1
 
+    def count_rewrite(self):
+        with self._lock:
+            self.rewrites += 1
+
     def count_upstream(self, name, ok, latency_ms=None):
         with self._lock:
             slot = self.upstreams.setdefault(name, {"ok": 0, "fail": 0, "latency_ms": None})
@@ -234,13 +365,20 @@ class DnsStats:
                 "blocked": self.blocked,
                 "cache_hits": self.cache_hits,
                 "failed": self.failed,
+                "rewrites": self.rewrites,
                 "blocked_log": list(self.log),
+                "upstreams": {k: dict(v) for k, v in self.upstreams.items()},
+                "log_size": self.query_log.size,
+                "log_paused": self.query_log.paused,
             }
 
     def reset(self):
         with self._lock:
             self.total = self.blocked = self.cache_hits = self.failed = 0
+            self.rewrites = 0
             self.log.clear()
+            self.upstreams.clear()
+        self.query_log.clear()
 
 
 class DnsFilter:
@@ -257,10 +395,16 @@ class DnsFilter:
 
         self.upstreams = []          # [Upstream]
         self.selected = 0            # 默认上游下标
+        self.upstream_strategy = STRATEGY_SEQUENTIAL
+        self.upstream_timeout = 4.0
+        self.cache_min_ttl = 0
+        self.cache_max_ttl = 86400
+        self.rewrites = {}           # domain -> ip text
         self.stats = DnsStats()
 
-        self._exact = set()
-        self._suffix = set()
+        self._rules = RuleSet()
+        self._file_lines = []
+        self._extra_lines = []       # 过滤器列表 + 自定义规则
         self._cache = {}             # (name, qtype) -> (expires, resp, min_ttl)
         self._cache_lock = threading.Lock()
         self._servers = []
@@ -327,7 +471,7 @@ class DnsFilter:
         class HandlerUDP(socketserver.BaseRequestHandler):
             def handle(self):
                 data, sock = self.request
-                resp = dns_filter.handle_query(data)
+                resp = dns_filter.handle_query(data, client=self.client_address[0])
                 if resp:
                     try:
                         sock.sendto(resp, self.client_address)
@@ -344,7 +488,7 @@ class DnsFilter:
                     hdr = self._recv(2)
                     (length,) = struct.unpack(">H", hdr)
                     query = self._recv(length)
-                    resp = dns_filter.handle_query(query)
+                    resp = dns_filter.handle_query(query, client=self.client_address[0])
                     if resp:
                         self.request.sendall(struct.pack(">H", len(resp)) + resp)
                 except (OSError, struct.error):
@@ -385,7 +529,7 @@ class DnsFilter:
         return getattr(self, "_bind_errors", [])
 
     # ---------------- 报文处理 ----------------
-    def handle_query(self, data):
+    def handle_query(self, data, client=""):
         """处理一条原始查询，返回应答报文或 None（无法解析）。"""
         if len(data) < 17 or not (data[2] & 0x01):  # 必须是查询（QR=0）
             return None
@@ -396,15 +540,27 @@ class DnsFilter:
             return None
         self.stats.count_query()
         name_l = name.rstrip(".").lower()
+        question = data[12:q_end]
 
-        # 1. 黑名单拦截
+        # 1. 过滤规则（例外优先，由 RuleSet 保证）
         rule = self._match_block(name_l)
         if rule:
             action = "返回黑洞地址" if self.block_action == "blackhole" else "返回 NXDOMAIN"
             self.stats.count_blocked(name_l, rule, action)
-            return self._build_blocked(query_id, data[12:q_end], qtype)
+            self.stats.query_log.add(client, name_l, qtype, RESULT_BLOCKED, rule=rule)
+            return self._build_blocked(query_id, question, qtype)
 
-        # 2. 缓存
+        # 2. DNS 重写
+        target = self._match_rewrite(name_l)
+        if target:
+            self.stats.count_rewrite()
+            self.stats.query_log.add(client, name_l, qtype, RESULT_REWRITE,
+                                     rule=f"重写 → {target}")
+            resp = self._build_rewrite(query_id, question, qtype, target)
+            if resp:
+                return resp
+
+        # 3. 缓存
         cache_key = (name_l, qtype)
         now = time.monotonic()
         with self._cache_lock:
@@ -412,6 +568,7 @@ class DnsFilter:
         if cached and cached[0] > now:
             _expires, resp, min_ttl = cached
             self.stats.count_cache()
+            self.stats.query_log.add(client, name_l, qtype, RESULT_CACHED)
             # 把缓存期间流逝的秒数从各应答 TTL 里扣掉
             stored_at = _expires - min_ttl
             elapsed = max(0, now - stored_at)
@@ -420,25 +577,69 @@ class DnsFilter:
             with self._cache_lock:
                 self._cache.pop(cache_key, None)
 
-        # 3. 上游（选中的优先，失败则依次尝试其余）
-        ordered = self._ordered_upstreams()
-        for up in ordered:
-            start = time.monotonic()
-            try:
-                resp = up.query(data, timeout=4.0)
-            except Exception as e:
-                logger.debug(f"上游 {up.name}({up.proto}) 查询失败: {e}")
-                self.stats.count_upstream(up.name, False)
-                continue
-            latency = round((time.monotonic() - start) * 1000, 1)
-            self.stats.count_upstream(up.name, True, latency)
-            if len(resp) < 12:
-                continue
-            self._store_cache(cache_key, resp, q_end)
-            return self._patch_id(resp, query_id)
+        # 4. 上游（顺序优先 / 并行最快）
+        start = time.monotonic()
+        resp, used = self._query_upstreams(data)
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+        if resp is None:
+            self.stats.count_failed()
+            self.stats.query_log.add(client, name_l, qtype, RESULT_FAIL,
+                                     ms=elapsed_ms, upstream=used)
+            return self._build_servfail(query_id, question)
+        self._store_cache(cache_key, resp, q_end)
+        self.stats.query_log.add(client, name_l, qtype, RESULT_ALLOW,
+                                 upstream=used, ms=elapsed_ms)
+        return self._patch_id(resp, query_id)
 
-        self.stats.count_failed()
-        return self._build_servfail(query_id, data[12:q_end])
+    def _query_upstreams(self, data):
+        """按策略查询上游，返回 (应答报文|None, 上游名)。"""
+        ordered = self._ordered_upstreams()
+        if not ordered:
+            return None, ""
+        if self.upstream_strategy == STRATEGY_PARALLEL and len(ordered) > 1:
+            return self._query_parallel(ordered, data)
+        for up in ordered:
+            resp = self._query_one(up, data)
+            if resp is not None:
+                return resp, up.name
+        return None, ""
+
+    def _query_one(self, up, data):
+        start = time.monotonic()
+        try:
+            resp = up.query(data, timeout=self.upstream_timeout)
+        except Exception as e:
+            logger.debug(f"上游 {up.name}({up.proto}) 查询失败: {e}")
+            self.stats.count_upstream(up.name, False)
+            return None
+        if len(resp) < 12:
+            self.stats.count_upstream(up.name, False)
+            return None
+        latency = round((time.monotonic() - start) * 1000, 1)
+        self.stats.count_upstream(up.name, True, latency)
+        return resp
+
+    def _query_parallel(self, ordered, data):
+        """并发问前几个上游，谁先回有效应答就用谁（AdGuard 的并行请求策略）。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        workers = min(3, len(ordered))
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dns-up")
+        try:
+            futures = {pool.submit(self._query_one, up, data): up for up in ordered[:workers]}
+            for fut in as_completed(futures, timeout=self.upstream_timeout + 2):
+                up = futures[fut]
+                try:
+                    resp = fut.result()
+                except Exception:
+                    continue
+                if resp is not None:
+                    return resp, up.name
+        except Exception as e:
+            logger.debug(f"并行上游查询异常: {e}")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return None, ""
 
     def _ordered_upstreams(self):
         with self._state_lock:
@@ -460,57 +661,81 @@ class DnsFilter:
                 return None
             return self.upstreams[min(self.selected, len(self.upstreams) - 1)]
 
-    # ---------------- 黑名单 ----------------
+    # ---------------- 过滤规则 ----------------
     def _load_defaults(self):
-        exact, suffix = set(), set()
-        for entry in DEFAULT_BLOCKLIST:
-            entry = entry.strip().lower().rstrip(".")
-            if not entry or any(ch in entry for ch in "* /"):
-                continue  # 通配/路径行不支持
-            # 统一按「拦截该域及其全部子域」处理
-            suffix.add(entry)
-        self._apply_blocklists(exact, suffix)
+        lines = [d.strip().lower().rstrip(".") for d in DEFAULT_BLOCKLIST
+                 if d.strip() and not any(ch in d for ch in "* /")]
+        self._file_lines = lines
+        self._rebuild_rules()
 
     def _apply_blocklists(self, exact, suffix):
-        self._exact = exact
-        self._suffix = suffix
-        logger.info(f"DNS 黑名单已加载：{len(exact)} 精确 + {len(suffix)} 后缀")
+        """兼容旧接口：直接给定精确集与后缀集，重建规则。"""
+        self._file_lines = sorted({d.strip().lower().rstrip(".") for d in (exact | suffix) if d})
+        self._rebuild_rules()
+
+    def _rebuild_rules(self):
+        rules = compile_rules(self._file_lines, self._extra_lines)
+        self._rules = rules
+        logger.info(f"DNS 过滤规则已加载：{rules.count} 条"
+                    f"（后缀 {rules.suffix_count}，例外 {rules.allow_count}）")
+        return rules
+
+    def set_filter_sources(self, list_lines=None, custom_lines=None):
+        """替换「过滤器列表 + 自定义规则」并重建规则集。"""
+        lines = list(list_lines or []) + list(custom_lines or [])
+        self._extra_lines = lines
+        return self._rebuild_rules()
 
     def reload_blocklist(self):
-        """从 blocklist_path 重新加载黑名单。支持 hosts 格式与纯域名格式。"""
-        exact, suffix = set(), set()
+        """从 blocklist_path 重新加载黑名单。支持 hosts / 纯域名 / AdGuard 语法。"""
         try:
             if self.blocklist_path and os.path.exists(self.blocklist_path):
                 with open(self.blocklist_path, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        line = line.split("#", 1)[0].split("!", 1)[0].strip().lower()
-                        if not line:
-                            continue
-                        parts = line.split()
-                        domain = parts[1] if len(parts) >= 2 and parts[0].rstrip(".") in ("0.0.0.0", "127.0.0.1", "::") else parts[0]
-                        domain = domain.lstrip("*.").rstrip(".").strip()
-                        if domain and len(domain) > 3 and " " not in domain and "/" not in domain:
-                            suffix.add(domain)
+                    self._file_lines = [ln.strip() for ln in f
+                                        if ln.strip() and not ln.strip().startswith("#")]
             else:
                 self._load_defaults()
-                return
+                return self._rules
         except Exception as e:
             logger.error(f"加载 DNS 黑名单失败: {e}")
-            return
-        self._apply_blocklists(exact, suffix)
+            return self._rules
+        return self._rebuild_rules()
 
     def _match_block(self, domain):
-        if domain in self._exact or domain in self._suffix:
-            return domain
-        idx = 0
-        while True:
-            idx = domain.find(".", idx)
-            if idx == -1:
-                return None
+        blocked, rule = self._rules.match(domain)
+        return rule if blocked else None
+
+    @property
+    def rules(self):
+        return self._rules
+
+    # ---------------- DNS 重写 ----------------
+    def set_rewrites(self, mapping):
+        """mapping: {domain: ip}；支持 *.example.com 形式的通配。"""
+        clean = {}
+        for host, ip in (mapping or {}).items():
+            host = (host or "").strip().lower().rstrip(".")
+            if not host or not ip_to_rdata(ip):
+                continue
+            clean[host] = (ip or "").strip()
+        with self._state_lock:
+            self.rewrites = clean
+        return len(clean)
+
+    def _match_rewrite(self, domain):
+        with self._state_lock:
+            mapping = self.rewrites
+        if not mapping:
+            return None
+        if domain in mapping:
+            return mapping[domain]
+        idx = domain.find(".")
+        while idx != -1:
             parent = domain[idx + 1:]
-            if parent in self._suffix:
-                return parent
-            idx += 1
+            if f"*.{parent}" in mapping:
+                return mapping[f"*.{parent}"]
+            idx = domain.find(".", idx + 1)
+        return None
 
     # ---------------- 缓存 ----------------
     def _store_cache(self, key, resp, q_end):
@@ -520,12 +745,21 @@ class DnsFilter:
                 min_ttl = 300
             if min_ttl <= 0:
                 return
+            min_ttl = max(int(self.cache_min_ttl), min(int(self.cache_max_ttl), int(min_ttl)))
             with self._cache_lock:
                 if len(self._cache) >= self.CACHE_MAX:
                     self._cache.clear()
                 self._cache[key] = (time.monotonic() + min_ttl, resp, min_ttl)
         except Exception:
             pass
+
+    def clear_cache(self):
+        with self._cache_lock:
+            self._cache.clear()
+
+    def cache_size(self):
+        with self._cache_lock:
+            return len(self._cache)
 
     def _walk_answers(self, data, q_end, rewrite, elapsed=0.0):
         """遍历应答记录。rewrite=True 时把 TTL 就地减去 elapsed。
@@ -634,6 +868,19 @@ class DnsFilter:
         answer = (b"\xc0\x0c" + struct.pack(">HHIH", rr_type, 1, 10, len(rdata)) + rdata)
         return self._build_header(query_id, ancount=1) + question_bytes + answer
 
+    def _build_rewrite(self, query_id, question_bytes, qtype, ip_text):
+        """按重写目标构造应答；类型不匹配时返回空应答（NODATA）。"""
+        parsed = ip_to_rdata(ip_text)
+        if not parsed:
+            return None
+        rr_type, rdata = parsed
+        if qtype != rr_type:
+            # 有 A 重写但查的是 AAAA（或反之）→ 回空应答，避免回落真实 IP
+            return self._build_header(query_id) + question_bytes
+        ttl = max(10, min(600, int(self.cache_max_ttl) or 600))
+        answer = (b"\xc0\x0c" + struct.pack(">HHIH", rr_type, 1, ttl, len(rdata)) + rdata)
+        return self._build_header(query_id, ancount=1) + question_bytes + answer
+
     @staticmethod
     def _build_servfail(query_id, question_bytes):
         return DnsFilter._build_header(query_id, rcode=2) + question_bytes
@@ -682,7 +929,9 @@ class DnsFilter:
                 "port": self.port,
                 "block_action": self.block_action,
                 "selected": self.selected,
+                "strategy": self.upstream_strategy,
                 "upstreams": [u.to_dict() for u in self.upstreams],
+                "rewrites": dict(self.rewrites),
             }
 
     def import_config(self, data):
@@ -692,3 +941,8 @@ class DnsFilter:
             self.selected = int(data.get("selected", 0))
             self.port = int(data.get("port", self.port))
             self.block_action = data.get("block_action", self.block_action)
+            strategy = data.get("strategy", self.upstream_strategy)
+            if strategy in (STRATEGY_SEQUENTIAL, STRATEGY_PARALLEL):
+                self.upstream_strategy = strategy
+        if isinstance(data.get("rewrites"), dict):
+            self.set_rewrites(data["rewrites"])

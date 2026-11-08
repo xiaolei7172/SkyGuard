@@ -89,6 +89,14 @@ DEFAULT_CONFIG = {
         "listen_lan": False,                  # True 时同时监听 0.0.0.0（局域网设备可访问）
         "block_action": "blackhole",          # blackhole=返回0.0.0.0 / nxdomain=返回不存在
         "selected_upstream": 0,
+        # sequential=按顺序优先；parallel=并发问前几个，谁快用谁（AdGuard 风格）
+        "strategy": "sequential",
+        "cache_min_ttl": 0,
+        "cache_max_ttl": 86400,
+        "log_enabled": True,                  # 记录查询日志（可暂停，不落盘）
+        "lists": [],                          # 过滤器列表 [{name,url,enabled,interval,count,updated}]
+        "custom_rules": [],                   # 自定义规则（AdGuard 语法，一行一条）
+        "rewrites": {},                       # DNS 重写 {域名: IP}
         "upstreams": [
             {"name": "阿里 UDP", "proto": "UDP", "address": "223.5.5.5:53"},
             {"name": "阿里 DoT", "proto": "DoT", "address": "223.5.5.5:853"},
