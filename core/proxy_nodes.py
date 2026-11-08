@@ -432,6 +432,10 @@ class NodeStore:
         self.save()
         return len(nodes)
 
+    def add_subscription(self, name, url):
+        """只登记订阅不解析节点（mihomo 内核自己拉取）。"""
+        return self.upsert_subscription(name, url, [])
+
     def remove_subscription(self, name_or_url):
         before = len(self.subscriptions)
         self.subscriptions = [

@@ -365,6 +365,9 @@ class ConfigManager:
                     "allow_lan": self.proxy_allow_lan,
                     "set_system_proxy": self.proxy_set_system_proxy,
                     "selected_node": self.proxy_selected_node,
+                    "engine": self.proxy_engine,
+                    "kernel_path": self.proxy_kernel_path,
+                    "clash_api_port": self.proxy_clash_api_port,
                     "rules": self.proxy_rules,
                     "accel_groups": self.proxy_accel_groups,
                     "extra_domains": self.proxy_extra_domains,
@@ -486,6 +489,14 @@ class ConfigManager:
 
         self.proxy_selected_node = str(cfg.get("selected_node", "") or "")
 
+        engine = str(cfg.get("engine", default.get("engine", "builtin"))).strip().lower()
+        self.proxy_engine = engine if engine in ("builtin", "clash") else "builtin"
+        self.proxy_kernel_path = str(cfg.get("kernel_path", "") or "").strip()
+        try:
+            self.proxy_clash_api_port = min(65535, max(1024, int(cfg.get("clash_api_port", default.get("clash_api_port", 19090)))))
+        except (TypeError, ValueError):
+            self.proxy_clash_api_port = 19090
+
         rules = cfg.get("rules")
         if isinstance(rules, list) and rules:
             cleaned = []
@@ -537,6 +548,9 @@ class ConfigManager:
             "allow_lan": "proxy_allow_lan",
             "set_system_proxy": "proxy_set_system_proxy",
             "selected_node": "proxy_selected_node",
+            "engine": "proxy_engine",
+            "kernel_path": "proxy_kernel_path",
+            "clash_api_port": "proxy_clash_api_port",
             "rules": "proxy_rules",
             "accel_groups": "proxy_accel_groups",
             "extra_domains": "proxy_extra_domains",

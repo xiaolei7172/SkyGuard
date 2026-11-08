@@ -95,8 +95,8 @@
 | 能力 | 说明 |
 | :--- | :--- |
 | 入口 | HTTP 代理（CONNECT 隧道 + 普通 http 转发）与 SOCKS5 共用同一端口 |
-| 节点 | Shadowsocks AEAD（aes-128/192/256-gcm、chacha20-ietf-poly1305）、Trojan、HTTP、SOCKS5 |
-| 订阅 | 支持 Clash YAML 与 base64 通用订阅，vmess / vless 等 QUIC 系协议会明确提示暂不支持，不做假连接 |
+| 内核 | 页面可切换：**内置引擎**（Shadowsocks AEAD、Trojan、HTTP、SOCKS5）或 **Clash 内核 mihomo**（hysteria2 / vless / vmess 等全部协议，自动复用本机 Clash Verge 自带内核，也支持一键从 GitHub 下载官方内核） |
+| 订阅 | 内置引擎解析 Clash YAML 与 base64 通用订阅；mihomo 内核模式下订阅直接交给内核拉取与定时更新 |
 | 模式 | 智能模式（默认，国内直连 / 国外走代理）、仅按规则、全局代理、全部直连 |
 | 规则 | domain-suffix / domain / keyword / regex / ip-cidr / final，动作支持加速直连、直连、走节点、拒绝，页面可视化增删 |
 | 接管 | 可自动把系统代理指向本机（备份原值，退出自动还原），本机与内网地址在任何模式下都强制直连 |
@@ -113,6 +113,8 @@
 5. 解析失败或超时 → 走代理（被墙域名本地 DNS 往往直接失败，交给节点出口解析反而更容易通）。
 
 没配置节点时国外站点会直连兜底，页面会提示先添加订阅；IP 判定结果带 10 分钟缓存，不会每条连接都去解析。
+
+内核模式下节点测速 / 切换 / 流量与连接监控都通过 mihomo 的 RESTful API 完成；DNS 过滤器运行中时，内核 DNS 解析会自动走本机 53 端口，代理流量同样经过广告过滤。
 
 测速延迟来自节点对 `www.gstatic.com:80` 的真实握手耗时；本机与内网地址任何模式下都直连。
 

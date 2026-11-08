@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
 
 from core import ip_optimizer
 from core.ip_optimizer import DOMAIN_GROUPS, IpCache
+from core import clash_kernel
+from core.clash_kernel import KernelNotFound, MihomoKernel
 from core.geo import get_classifier
 from core.local_proxy import (
     ACTION_ACCEL, ACTION_DIRECT, ACTION_PROXY, ACTION_REJECT,
@@ -35,7 +37,7 @@ from core.local_proxy import (
 )
 from core.proxy_connectors import probe_node
 from core.proxy_nodes import (
-    KNOWN_UNSUPPORTED, NodeStore, fetch_subscription,
+    KNOWN_UNSUPPORTED, NodeStore, ProxyNode, fetch_subscription,
     parse_proxy_uri, parse_subscription,
 )
 from ui.styles import StyleHelper
@@ -68,12 +70,16 @@ class AccelPage(QWidget):
         self.node_store = NodeStore()
         self.ip_cache = IpCache()
         self.selected_uid = config_manager.proxy_selected_node
+        if self.selected_uid.startswith("kernel:"):
+            self.selected_kernel_node = self.selected_uid[len("kernel:"):]
         self._optimizing = False
         self._testing_nodes = False
         self._last_proxy_error = ""
         self._stats_sig = None
         self._status_cache = (0.0, None)
         self.geo = get_classifier()
+        self.kernel = None                 # Clash(mihomo) 内核实例，engine=clash 时使用
+        self.selected_kernel_node = ""     # 内核模式下选中的节点名
 
         self.proxy = LocalProxy(
             host=config_manager.proxy_host,
@@ -230,6 +236,29 @@ class AccelPage(QWidget):
         self.status_detail.setSizePolicy(self.status_detail.sizePolicy().horizontalPolicy(),
                                          self.status_detail.sizePolicy().verticalPolicy())
         row2.addWidget(self.status_detail, 1)
+        box.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        engine_label = QLabel("内核")
+        row3.addWidget(engine_label)
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem("内置引擎（ss / trojan / http / socks5）", "builtin")
+        self.engine_combo.addItem("Clash 内核 mihomo（全协议，含 hysteria2 / vless）", "clash")
+        eng_index = self.engine_combo.findData(
+            getattr(self.config_manager, "proxy_engine", "builtin"))
+        self.engine_combo.setCurrentIndex(max(0, eng_index))
+        self.engine_combo.currentIndexChanged.connect(self.on_engine_changed)
+        self._shrinkable_combo(self.engine_combo)
+        row3.addWidget(self.engine_combo, 1)
+        self.kernel_btn = QPushButton("下载内核")
+        self.kernel_btn.clicked.connect(self.on_locate_or_download_kernel)
+        StyleHelper.set_button_type(self.kernel_btn, "default")
+        row3.addWidget(self.kernel_btn)
+        self.kernel_label = QLabel(self._kernel_state_text())
+        self.kernel_label.setStyleSheet("color: #8c8c8c;")
+        self.kernel_label.setWordWrap(True)
+        row3.addWidget(self.kernel_label, 2)
+        box.addLayout(row3)
 
         group.setLayout(box)
         return group
@@ -502,27 +531,160 @@ class AccelPage(QWidget):
         self.config_manager.set_proxy_config(
             set_system_proxy=self.sysproxy_check.isChecked())
 
+    # -- 内核（mihomo）-----------------------------------------------
+    def _kernel_state_text(self):
+        path = clash_kernel.find_kernel(
+            getattr(self.config_manager, "proxy_kernel_path", ""))
+        if path:
+            short = path if len(path) <= 60 else "…" + path[-58:]
+            return f"已找到：{short}"
+        return "未找到内核，点击右侧按钮自动下载（约 12MB）"
+
+    def _engine(self):
+        return self.engine_combo.currentData() or "builtin"
+
+    def _engine_running(self):
+        if self._engine() == "clash":
+            return self.kernel is not None and self.kernel.running
+        return self.proxy.running
+
+    def _clash_mode(self):
+        """SkyGuard 模式 → mihomo 模式。smart 用 rule 引擎 + GEOIP,CN,DIRECT。"""
+        mode = self.mode_combo.currentData()
+        return "rule" if mode == MODE_SMART else mode
+
+    def _local_dns_available(self):
+        """DNS 过滤器在跑时让内核 DNS 走本机 53，代理流量同样经过广告过滤。"""
+        import socket
+        try:
+            with socket.create_connection(("127.0.0.1", 53), timeout=0.3):
+                return True
+        except OSError:
+            return False
+
+    def on_engine_changed(self):
+        engine = self._engine()
+        self.config_manager.set_proxy_config(engine=engine)
+        if self._engine_running():
+            # 运行中切换内核：直接按新引擎重启，系统代理指向不变
+            self.on_stop_proxy()
+            self.on_start_proxy()
+        self.kernel_label.setText(self._kernel_state_text())
+
+    def on_locate_or_download_kernel(self):
+        path = clash_kernel.find_kernel(
+            getattr(self.config_manager, "proxy_kernel_path", ""))
+        if path:
+            self.kernel_label.setText(f"已找到：{path}")
+            QMessageBox.information(self, "Clash 内核", f"使用内核：\n{path}")
+            return
+        if not QMessageBox.question(
+                self, "下载内核",
+                "未找到 mihomo 内核，是否从 GitHub 自动下载官方版（约 12MB）？\n"
+                "也可以把 mihomo.exe 放到 %USERPROFILE%\\.skyguard\\core\\ 目录。"
+                ) == QMessageBox.StandardButton.Yes:
+            return
+        self.kernel_btn.setEnabled(False)
+        self.kernel_label.setText("正在下载内核…")
+
+        def work():
+            return clash_kernel.download_kernel(progress=lambda m: self._ui(
+                lambda: self.kernel_label.setText(m)))
+
+        def done(result):
+            self.kernel_btn.setEnabled(True)
+            self.kernel_label.setText(f"已下载：{result}")
+            self.sub_hint.setText("内核下载完成，可以启动代理了")
+
+        def failed(err):
+            self.kernel_btn.setEnabled(True)
+            self.kernel_label.setText(f"下载失败：{err}")
+            self.sub_hint.setText(f"内核下载失败：{err}")
+
+        self._run(work, done, failed)
+
+    def _start_clash(self, port, host):
+        """用 mihomo 内核启动代理。成功返回 True。"""
+        kernel_path = clash_kernel.find_kernel(
+            getattr(self.config_manager, "proxy_kernel_path", ""))
+        if not kernel_path:
+            QMessageBox.warning(self, "Clash 内核",
+                                "未找到 mihomo 内核，请先点击「下载内核」。\n"
+                                "内核原生支持 hysteria2 / vless 等全部协议。")
+            return False
+        if self.kernel is not None:
+            self.kernel.stop()
+        try:
+            kernel = MihomoKernel(
+                kernel_path,
+                os.path.join(os.path.expanduser("~"), ".skyguard", "clash"),
+                mixed_port=port,
+                api_port=self.config_manager.proxy_clash_api_port,
+                allow_lan=(host == "0.0.0.0"))
+            accel_domains = set(self.ip_cache.data.keys())
+            config = clash_kernel.build_config(
+                subscriptions=self.node_store.subscriptions,
+                manual_nodes=[n for n in (ProxyNode.from_dict(m)
+                                          for m in self.node_store.manual)
+                              if n and n.supported],
+                rules=self._rules_for_engine(),
+                mixed_port=port,
+                api_port=self.config_manager.proxy_clash_api_port,
+                allow_lan=(host == "0.0.0.0"),
+                clash_mode=self._clash_mode(),
+                local_dns=self._local_dns_available(),
+                accel_domains=accel_domains)
+            kernel.start(config)
+        except (KernelNotFound, RuntimeError) as e:
+            QMessageBox.critical(self, "代理服务", f"Clash 内核启动失败：\n{e}")
+            self._style_pill(False)
+            return False
+        self.kernel = kernel
+        if self.selected_kernel_node:
+            try:
+                kernel.select_proxy(self.selected_kernel_node)
+            except OSError as e:
+                logger.debug(f"恢复选中节点失败: {e}")
+        return True
+
+    def _stop_kernel(self):
+        if self.kernel is not None:
+            try:
+                self.kernel.stop()
+            except Exception as e:
+                logger.debug(f"停止内核失败: {e}")
+            self.kernel = None
+
     def on_start_proxy(self):
         port = self.listen_port.value()
         host = self.listen_host.currentText()
-        if self.proxy.running and (self.proxy.port != port or self.proxy.host != host):
-            # 端口/监听地址改了，先停掉旧监听再按新参数起
-            self.proxy.stop()
-        self.proxy.host = host
-        self.proxy.port = port
-        self.proxy.set_mode(self.mode_combo.currentData())
-        self.proxy.set_rules(self._rules_for_engine())
-        ok = self.proxy.start()
-        if not ok:
-            QMessageBox.critical(self, "代理服务", "启动失败：\n" + "\n".join(self.proxy.bind_errors or
-                                                                        ["端口被占用，换个端口试试"]))
-            self._style_pill(False)
-            return
+        mode = self.mode_combo.currentData()
+        self.config_manager.set_proxy_config(enabled=True, host=host, port=port, mode=mode)
 
-        self.config_manager.set_proxy_config(enabled=True, host=host, port=port,
-                                             mode=self.mode_combo.currentData())
+        if self._engine() == "clash":
+            self.proxy.stop()          # 内核模式下内置引擎保持停止
+            self.proxy.port = port     # 供系统代理判断使用
+            if not self._start_clash(port, host):
+                return
+        else:
+            self._stop_kernel()
+            if self.proxy.running and (self.proxy.port != port or self.proxy.host != host):
+                # 端口/监听地址改了，先停掉旧监听再按新参数起
+                self.proxy.stop()
+            self.proxy.host = host
+            self.proxy.port = port
+            self.proxy.set_mode(mode)
+            self.proxy.set_rules(self._rules_for_engine())
+            ok = self.proxy.start()
+            if not ok:
+                QMessageBox.critical(self, "代理服务", "启动失败：\n" + "\n".join(self.proxy.bind_errors or
+                                                                            ["端口被占用，换个端口试试"]))
+                self._style_pill(False)
+                return
+
         self._style_pill(True)
         self.status_changed.emit(True)
+        self.refresh_node_table()
 
         if self.sysproxy_check.isChecked():
             ok2, msg = system_proxy.set_proxy(f"127.0.0.1:{port}")
@@ -534,6 +696,7 @@ class AccelPage(QWidget):
     def on_stop_proxy(self):
         port = self.proxy.port
         was_system = system_proxy.is_pointing_to(port)
+        self._stop_kernel()
         self.proxy.stop()
         self._style_pill(False)
         self.config_manager.set_proxy_config(enabled=False)
@@ -542,6 +705,7 @@ class AccelPage(QWidget):
             ok, msg = system_proxy.clear_proxy()
             self.conn_hint.setText(msg)
         self.refresh_status()
+        self.refresh_node_table()
 
     def on_toggle_system_proxy(self):
         port = self.proxy.port
@@ -566,13 +730,22 @@ class AccelPage(QWidget):
             self._status_cache = (now, info)
         proxy_state = (f"系统代理：{info['server']}" if info["enabled"]
                        else "系统代理：未启用")
-        node = self._current_node()
-        if node:
-            node_state = f"节点：{node.name}"
-        elif self.proxy.engine.mode == MODE_SMART:
-            node_state = "节点：未选择（国外站点会直连兜底，建议加一条订阅）"
+        if self._engine() == "clash":
+            if self.kernel is not None and self.kernel.running:
+                if self.selected_kernel_node:
+                    node_state = f"节点：{self.selected_kernel_node}"
+                else:
+                    node_state = "节点：未选择（内核用默认第一个节点）"
+            else:
+                node_state = "节点：内核未运行"
         else:
-            node_state = "节点：未选择（加速规则仍可用）"
+            node = self._current_node()
+            if node:
+                node_state = f"节点：{node.name}"
+            elif self.proxy.engine.mode == MODE_SMART:
+                node_state = "节点：未选择（国外站点会直连兜底，建议加一条订阅）"
+            else:
+                node_state = "节点：未选择（加速规则仍可用）"
         self.status_detail.setText(f"{node_state}    |    {proxy_state}")
         self.sysproxy_btn.setText("取消系统代理" if system_proxy.is_pointing_to(self.proxy.port)
                                   else "设为系统代理")
@@ -580,6 +753,9 @@ class AccelPage(QWidget):
     def refresh_stats(self):
         # 页面不可见时不刷新，避免后台空转
         if not self.isVisible():
+            return
+        if self._engine() == "clash":
+            self._refresh_stats_kernel()
             return
         snap = self.proxy.stats.snapshot()
         self.stat_cards["total"].setText(str(snap["total"]))
@@ -611,7 +787,64 @@ class AccelPage(QWidget):
                     cell.setToolTip(item["result"])
                 self.conn_table.setItem(r, c, cell)
 
+    def _refresh_stats_kernel(self):
+        """mihomo 内核模式：统计与连接列表来自 RESTful API。"""
+        if not (self.kernel is not None and self.kernel.running):
+            return
+        try:
+            info = self.kernel.traffic()
+            conns = self.kernel.recent_connections(limit=60)
+        except OSError as e:
+            logger.debug(f"读取内核状态失败: {e}")
+            return
+        self.stat_cards["total"].setText(str(info["active"]))
+        proxied = sum(1 for c in conns
+                      if c["node"] not in ("DIRECT", "REJECT", ""))
+        self.stat_cards["proxied"].setText(str(proxied))
+        self.stat_cards["accel"].setText(str(len(conns) - proxied))
+        traffic = f"↑{format_bytes(info['up'])}  ↓{format_bytes(info['down'])}"
+        self.stat_cards["traffic"].setText(traffic)
+
+        rows = []
+        for c in reversed(conns):
+            action = "直连" if c["node"] in ("DIRECT", "") else (
+                "拦截" if c["node"] == "REJECT" else "代理")
+            rows.append({
+                "time": (c["start"] or "")[11:19],
+                "host": c["host"], "port": c["port"], "node": c["node"],
+                "action": action, "rule": c["rule"], "result": "连接中",
+                "up": c["up"], "down": c["down"],
+            })
+        head = rows[0] if rows else {}
+        sig = (info["active"], info["up"], info["down"], len(rows),
+               head.get("time"), head.get("up"), head.get("down"))
+        if sig == self._stats_sig:
+            return
+        self._stats_sig = sig
+        self.conn_table.setRowCount(len(rows))
+        for r, item in enumerate(rows):
+            target = f"{item['host']}:{item['port']}"
+            if item["node"] and item["node"] not in ("DIRECT", "REJECT"):
+                target += f"  ({item['node']})"
+            traffic_text = f"{format_bytes(item['up'])} / {format_bytes(item['down'])}"
+            values = [item["time"], target, item["action"], item["rule"], traffic_text]
+            for c, text in enumerate(values):
+                cell = QTableWidgetItem(str(text))
+                if c in (0, 2, 4):
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.conn_table.setItem(r, c, cell)
+
     def on_clear_logs(self):
+        if self._engine() == "clash":
+            if self.kernel is not None and self.kernel.running:
+                try:
+                    self.kernel.close_all_connections()
+                except OSError as e:
+                    logger.debug(f"清空内核连接失败: {e}")
+            self._stats_sig = None
+            self.conn_table.setRowCount(0)
+            self.refresh_stats()
+            return
         self.proxy.stats.reset()
         self.refresh_stats()
 
@@ -620,6 +853,9 @@ class AccelPage(QWidget):
     # ------------------------------------------------------------------
     def refresh_node_table(self, latencies=None):
         latencies = latencies or {}
+        if self._engine() == "clash":
+            self._refresh_node_table_kernel(latencies)
+            return
         nodes = self.node_store.all_nodes()
         self.node_table.setRowCount(len(nodes))
         for r, node in enumerate(nodes):
@@ -645,12 +881,68 @@ class AccelPage(QWidget):
                               if total else "还没有节点，先添加订阅或手动填一条链接")
         self.refresh_status()
 
+    def _refresh_node_table_kernel(self, latencies):
+        """内核模式：节点列表来自 mihomo（订阅里的 hysteria2/vless 等全部在内）。"""
+        skip = {"DIRECT", "REJECT", "REJECT-DROP", "COMPATIBLE", "PASS",
+                "GLOBAL", "GLOBAL ", "PROXY", "节点选择"}
+        rows = []
+        if self.kernel is not None and self.kernel.running:
+            try:
+                info = self.kernel.proxies()
+            except OSError as e:
+                logger.debug(f"读取内核节点失败: {e}")
+                info = {}
+            for name, meta in info.items():
+                if name in skip or "all" in meta:
+                    continue
+                if str(meta.get("type", "")).lower() in ("direct", "reject",
+                                                        "compatible", "pass"):
+                    continue
+                rows.append((name, meta))
+        self._kernel_rows = rows
+        self.node_table.setRowCount(len(rows))
+        for r, (name, meta) in enumerate(rows):
+            hist = meta.get("history") or []
+            ms = latencies.get(name) or (hist[-1].get("delay") if hist else 0)
+            values = [
+                ("★ " if name == self.selected_kernel_node else "") + name,
+                str(meta.get("type", "")).upper(),
+                "—",
+                f"{ms} ms" if ms else "—",
+                "内核",
+            ]
+            for c, text in enumerate(values):
+                cell = QTableWidgetItem(text)
+                if c in (1, 3, 4):
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.node_table.setItem(r, c, cell)
+        if rows:
+            self.sub_hint.setText(f"mihomo 内核 · {len(rows)} 个节点"
+                                  "（订阅由内核自动拉取与更新）")
+        elif self.kernel is not None and self.kernel.running:
+            self.sub_hint.setText("内核已启动但还没有节点，请先添加订阅后重启代理")
+        else:
+            self.sub_hint.setText("Clash 内核未运行，启动代理后订阅会自动拉取")
+        self.refresh_status()
+
     def on_add_subscription(self):
         url = self.sub_url.text().strip()
         if not url:
             QMessageBox.information(self, "订阅", "请先填写订阅地址。")
             return
         name = self.sub_name.text().strip()
+        if self._engine() == "clash":
+            # 内核模式：订阅交给 mihomo 拉取，hysteria2 / vless 等协议原生支持
+            self.node_store.add_subscription(name or url, url)
+            self.sub_url.clear()
+            self.sub_name.clear()
+            self.sub_hint.setText("订阅已保存，mihomo 将自动拉取（含 hysteria2 / vless 节点）")
+            if self.kernel is not None and self.kernel.running:
+                self.on_stop_proxy()
+                self.on_start_proxy()
+            else:
+                self.refresh_node_table()
+            return
         self.sub_hint.setText("正在拉取订阅…")
 
         def work():
@@ -665,8 +957,10 @@ class AccelPage(QWidget):
                 tip = f"没有可用的节点（{detail}）" if detail else "订阅里没有识别到节点"
                 extra = "；".join(f"{k} 暂不支持（{KNOWN_UNSUPPORTED.get(k, '')}）"
                                  for k in skipped)
-                QMessageBox.warning(self, "订阅", tip + ("\n" + extra if extra else ""))
-                self.sub_hint.setText("订阅解析失败")
+                hint = ("\n提示：内置引擎不支持 hysteria2 / vless，"
+                        "在上方把内核切换为「Clash 内核 mihomo」即可全部支持。")
+                QMessageBox.warning(self, "订阅", tip + ("\n" + extra if extra else "") + hint)
+                self.sub_hint.setText("订阅解析失败（可切换 Clash 内核后重试）")
                 return
             self.node_store.upsert_subscription(name or url, url, nodes)
             self.refresh_node_table()
@@ -710,6 +1004,9 @@ class AccelPage(QWidget):
     def on_test_nodes(self):
         if self._testing_nodes:
             return
+        if self._engine() == "clash":
+            self._test_nodes_kernel()
+            return
         nodes = self.node_store.all_nodes()
         if not nodes:
             QMessageBox.information(self, "测速", "还没有节点。")
@@ -734,8 +1031,64 @@ class AccelPage(QWidget):
 
         self._run(work, done, failed)
 
+    def _test_nodes_kernel(self):
+        """内核模式测速：让 mihomo 对每个节点发真实探测请求。"""
+        if not (self.kernel is not None and self.kernel.running):
+            QMessageBox.information(self, "测速", "请先启动代理（Clash 内核）。")
+            return
+        self._testing_nodes = True
+        self.sub_hint.setText("正在通过内核测速…")
+        kernel = self.kernel
+
+        def work():
+            try:
+                info = kernel.proxies()
+            except OSError as e:
+                raise RuntimeError(f"读取内核节点失败: {e}")
+            skip = {"DIRECT", "REJECT", "REJECT-DROP", "COMPATIBLE", "PASS",
+                    "GLOBAL", "PROXY"}
+            names = [n for n, m in info.items()
+                     if n not in skip and "all" not in m]
+
+            def probe(name):
+                try:
+                    return name, kernel.test_delay(name, timeout_ms=5000)
+                except OSError:
+                    return name, 0
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(probe, names))
+            return {n: ms for n, ms in results if ms}
+
+        def done(latencies):
+            self._testing_nodes = False
+            self.refresh_node_table(latencies)
+            self.sub_hint.setText(f"测速完成：{len(latencies)} 个节点可用")
+
+        def failed(err):
+            self._testing_nodes = False
+            self.sub_hint.setText(f"测速失败：{err}")
+
+        self._run(work, done, failed)
+
     def on_use_node(self):
         row = self.node_table.currentRow()
+        if self._engine() == "clash":
+            rows = getattr(self, "_kernel_rows", [])
+            if row < 0 or row >= len(rows):
+                return
+            name = rows[row][0]
+            self.selected_kernel_node = name
+            self.config_manager.set_proxy_config(selected_node=f"kernel:{name}")
+            if self.kernel is not None and self.kernel.running:
+                try:
+                    self.kernel.select_proxy(name)
+                    self.sub_hint.setText(f"已切换节点：{name}")
+                except OSError as e:
+                    self.sub_hint.setText(f"切换节点失败：{e}")
+            self.refresh_node_table()
+            self.refresh_status()
+            return
         nodes = self.node_store.all_nodes()
         if row < 0 or row >= len(nodes):
             return
@@ -748,6 +1101,11 @@ class AccelPage(QWidget):
 
     def on_delete_node(self):
         row = self.node_table.currentRow()
+        if self._engine() == "clash":
+            QMessageBox.information(self, "删除节点",
+                                    "内核模式下节点来自订阅，由 mihomo 管理；"
+                                    "请移除对应订阅或更新订阅内容。")
+            return
         nodes = self.node_store.all_nodes()
         if row < 0 or row >= len(nodes):
             return
@@ -953,6 +1311,7 @@ class AccelPage(QWidget):
         try:
             port = self.proxy.port
             was_system = system_proxy.is_pointing_to(port)
+            self._stop_kernel()
             if self.proxy.running:
                 self.proxy.stop()
             if was_system:

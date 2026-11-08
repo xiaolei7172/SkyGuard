@@ -9,7 +9,7 @@
 APP_INFO = {
     "name": "SkyGuard",                        # 应用名称（同时决定构建产物名 SkyGuard.exe）
     "author": "xiaolei7172",                   # 维护者（原作者 CassianVale，见 README 致谢）
-    "version": "1.3.0",                       # 版本号（会被GitHub Actions构建时替换）
+    "version": "1.4.0",                       # 版本号（会被GitHub Actions构建时替换）
     "description": "天幕进程优化工具 · 游戏反作弊进程管理",      # 应用描述
     "github_repo": "xiaolei7172/SkyGuard",         # GitHub仓库
     "github_api_url": "https://api.github.com/repos/xiaolei7172/SkyGuard/releases/latest",  # GitHub API URL
@@ -72,6 +72,9 @@ DEFAULT_CONFIG = {
         "allow_lan": False,                   # True 时监听 0.0.0.0，局域网可用
         "set_system_proxy": True,             # 启动代理时顺带接管系统代理
         "selected_node": "",                  # 选中节点的 uid（空表示没有节点）
+        "engine": "builtin",                  # builtin=内置引擎 / clash=mihomo 内核（支持 hysteria2/vless 等全部协议）
+        "kernel_path": "",                    # mihomo 内核路径，空表示自动查找/下载
+        "clash_api_port": 19090,              # mihomo RESTful API 端口
         "rules": [],                          # 空列表表示使用内置默认规则
         "accel_groups": {                     # 优选 IP 覆盖范围
             "github": True,
