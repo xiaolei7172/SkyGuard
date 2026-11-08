@@ -273,7 +273,9 @@ class StartupPage(QWidget):
             return
         box = QMessageBox(self)
         box.setWindowTitle("启动项建议")
-        box.setText(f"<b>{item.name}</b><br>建议：{a.label}（{a.category}）")
+        # 名称来自注册表，可能被写成 <b> 之类的富文本标记，一律按纯文本渲染
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(f"{item.name}\n建议：{a.label}（{a.category}）")
         box.setInformativeText(
             f"理由：{a.reason}\n"
             f"关闭影响：{a.impact}\n"

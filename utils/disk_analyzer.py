@@ -43,6 +43,12 @@ SKIP_DIR_NAMES = {
     "windows.old", "程序文件", "$windows.~bt", "$windows.~ws",
 }
 
+# 网络文件系统：扫描会因网络抖动长时间阻塞，一律不纳入
+REMOTE_FS = {
+    "cifs", "smbfs", "nfs", "nfs4", "afpfs", "webdav", "davfs", "ftp",
+    "sshfs", "9p", "ceph", "glusterfs", "fuse.sshfs",
+}
+
 # 开发工具缓存：(名称, 路径模板, 说明, 清理方式)
 DEV_CACHES = [
     ("pip 缓存", r"%LocalAppData%\pip\Cache", "Python 包下载缓存", "pip cache purge"),
@@ -117,6 +123,40 @@ def _iter_files(root, cancel=None):
             continue
 
 
+def _wildcard_match(pattern, name):
+    """仅支持 * 和 ? 的轻量通配（与 clean_engine 保持一致，避免 [] 被当字符集）"""
+    import re
+    rx = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+    return re.match(rx, name, re.IGNORECASE) is not None
+
+
+def _expand_pattern_path(template):
+    """展开路径中任意层级的 * / ? （末段可以是文件，如 ext4.vhdx）"""
+    template = os.path.expandvars(template)
+    parts = [p for p in template.split(os.sep) if p]
+    if not parts:
+        return []
+    first = parts[0]
+    current = [first + os.sep if len(first) == 2 and first[1] == ":" else first]
+    for seg in parts[1:]:
+        nxt = []
+        for base in current:
+            if "*" in seg or "?" in seg:
+                try:
+                    with os.scandir(base) as it:
+                        for e in it:
+                            if _wildcard_match(seg, e.name):
+                                nxt.append(e.path)
+                except OSError:
+                    continue
+            else:
+                cand = os.path.join(base, seg)
+                if os.path.exists(cand):
+                    nxt.append(cand)
+        current = nxt
+    return current
+
+
 def dir_size(path, cancel=None, progress=None, label=""):
     """统计目录或文件占用 → (bytes, 文件数)"""
     if not path:
@@ -145,10 +185,23 @@ class DiskAnalyzer:
     # 磁盘概览
     # --------------------------------------
     @staticmethod
-    def overview():
+    def overview(include_removable=False):
+        """固定磁盘概览。
+
+        include_removable=False 时排除 U 盘等可移动盘与网络盘：
+        前者可能随时拔出，后者一旦断网会让遍历卡住数分钟。
+        """
         result = []
         for part in psutil.disk_partitions(all=False):
             if "cdrom" in (part.opts or "") or not part.mountpoint:
+                continue
+            opts = (part.opts or "").lower()
+            fstype = (part.fstype or "").lower()
+            if fstype in REMOTE_FS or "remote" in opts or "network" in opts:
+                logger.debug(f"跳过网络盘 {part.mountpoint}（{fstype}）")
+                continue
+            if not include_removable and "removable" in opts:
+                logger.debug(f"跳过可移动盘 {part.mountpoint}")
                 continue
             try:
                 usage = psutil.disk_usage(part.mountpoint)
@@ -166,8 +219,8 @@ class DiskAnalyzer:
         return result
 
     @staticmethod
-    def _fixed_drives():
-        return [d["mount"] for d in DiskAnalyzer.overview()]
+    def _fixed_drives(include_removable=False):
+        return [d["mount"] for d in DiskAnalyzer.overview(include_removable)]
 
     # --------------------------------------
     # 主流程
@@ -235,7 +288,8 @@ class DiskAnalyzer:
                 findings.append(_finding(
                     key=f"dup:{i}:{dup['hash'][:8]}", group="重复文件",
                     name=f"重复组 {i}（{len(dup['paths'])} 份，可省 {format_size(dup['wasted'])}）",
-                    detail=os.path.basename(dup["paths"][0]) + f" 等 {format_size(dup['size'])} 文件",
+                    detail=f"同一份 {format_size(dup['size'])} 的文件有 {len(dup['paths'])} 个副本"
+                           "（仅在 200MB 以上的大文件中比对）",
                     path=dup["paths"][0], size=dup["wasted"], count=len(dup["paths"]), risk=2,
                     action="open", action_text="保留一份即可",
                 ))
@@ -259,7 +313,6 @@ class DiskAnalyzer:
                      if f["risk"] <= 1 and not f["rule_keys"] and f["group"] != "磁盘占用")
         notice = sum(f["size"] for f in findings
                      if f["risk"] >= 2 and f["group"] != "磁盘占用")
-        used_files = len({f["path"] for f in findings if f["path"]})
 
         tick("分析完成", 100)
         return {
@@ -272,7 +325,7 @@ class DiskAnalyzer:
             "total_manual": manual,
             "total_notice": notice,
             "disk_used": disk_used,
-            "finding_count": used_files,
+            "finding_count": len(findings),
             "elapsed": time.time() - started,
             "deep": deep,
             "cancelled": cancelled(),
@@ -287,13 +340,16 @@ class DiskAnalyzer:
         sysdrive = os.environ.get("SystemDrive", "C:") + os.sep
 
         # 回收站（各盘）
+        # 注意：清空回收站不可恢复，因此不参与「一键清理可释放项」，
+        # 只在这里如实展示，让用户去「规则清理」页单独确认。
         rb_size, rb_count = self._recycle_stats(cancel)
         if rb_size:
             items.append(_finding(
                 "recycle_bin", "系统可清理", "回收站",
-                f"各磁盘回收站共 {rb_count} 个文件，清空后不可恢复",
+                f"各磁盘回收站共 {rb_count} 个文件；清空后不可恢复，需单独确认",
                 sysdrive, rb_size, rb_count, risk=1,
-                rule_keys=["recycle_bin"], action="rule", action_text="清空回收站",
+                rule_keys=["recycle_bin"], action="rule",
+                action_text="需到「规则清理」页单独清空",
             ))
 
         # Windows.old / 升级临时目录
@@ -462,22 +518,11 @@ class DiskAnalyzer:
         for name, template, desc, howto in DEV_CACHES:
             if cancel is not None and cancel.is_set():
                 return items
-            path = os.path.expandvars(template)
-            if "*" in path:
-                base, pattern = os.path.split(path)
-                base_dir = os.path.dirname(base)
-                matches = []
-                try:
-                    for entry in os.scandir(os.path.expandvars(base_dir)):
-                        if entry.is_dir(follow_symlinks=False):
-                            cand = os.path.join(entry.path, pattern)
-                            if os.path.exists(cand):
-                                matches.append(cand)
-                except OSError:
-                    matches = []
-                paths = matches
+            if "*" in template or "?" in template:
+                paths = _expand_pattern_path(template)
             else:
-                paths = [path] if os.path.exists(path) else []
+                expanded = os.path.expandvars(template)
+                paths = [expanded] if os.path.exists(expanded) else []
 
             for p in paths:
                 if p.lower() in seen:
@@ -543,7 +588,9 @@ class DiskAnalyzer:
                     return self._heap_sorted(heap)
                 scanned += 1
                 if scanned % 5000 == 0:
-                    tick(f"已扫描 {scanned} 个文件，发现 {len(heap)} 个大文件…", 50)
+                    # 遍历量不可预知，用对数式爬升给个可见的进度反馈
+                    pct = 36 + min(32, scanned // 12000)
+                    tick(f"已扫描 {scanned} 个文件，发现 {len(heap)} 个大文件…", pct)
                 if st.st_size < BIG_FILE_MIN:
                     continue
                 if os.path.basename(path).lower() in SYSTEM_FILE_NAMES:

@@ -176,9 +176,10 @@ _RULES = [
 ]
 
 # 常见系统组件（启动项里的官方项，建议保留）
+# 注意：不要在这里放 OneDrive / Teams —— 它们属于可按需关闭的云同步与聊天工具
 _SYSTEM_KEEP = re.compile(
-    r"(securityhealth|windows.*security|microsoft.*(onedrive|teams)|"
-    r"startmenuexperience|shellapp|explorer\.exe|ctfmon)",
+    r"(securityhealth|windows.*security|startmenuexperience|shellapp|"
+    r"explorer\.exe|ctfmon)",
     re.IGNORECASE,
 )
 

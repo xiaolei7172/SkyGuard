@@ -118,3 +118,32 @@ class TestAdviceDict(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestNoFalseKeep(unittest.TestCase):
+    """OneDrive / Teams 属可按需关闭，不能因为带 Microsoft 前缀就判保留"""
+
+    def test_onedrive_optional(self):
+        for name in ("Microsoft OneDrive", "OneDrive", "Microsoft Teams"):
+            a = advise(FakeItem(name))
+            self.assertEqual(a.verdict, VERDICT_OPTIONAL, name)
+
+
+class TestSystemTaskProtected(unittest.TestCase):
+    """\\Microsoft\\ 下的系统计划任务不应被推荐关闭"""
+
+    def test_windows_task_keep(self):
+        for task_path in (r"\Microsoft\Windows\InstallService\ScanForUpdates",
+                          r"\Microsoft\Windows\UpdateOrchestrator\Reboot"):
+            item = FakeItem("ScanForUpdates", kind="task")
+            item.task_path = task_path
+            self.assertEqual(advise(item).verdict, VERDICT_KEEP, task_path)
+
+
+class TestPathNotMisjudged(unittest.TestCase):
+    """安装路径里碰巧带 steam/update 不应改变判定（规则按名称匹配）"""
+
+    def test_path_keyword_ignored(self):
+        # 真实存在的程序，但命令行参数里带 steam 路径
+        item = FakeItem("LosslessScaling", REAL_EXE + ' "E:\\Steam\\steam.exe"')
+        self.assertNotEqual(advise(item).verdict, VERDICT_DISABLE)

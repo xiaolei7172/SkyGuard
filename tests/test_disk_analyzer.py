@@ -7,6 +7,7 @@ import sys
 import time
 import tempfile
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -114,3 +115,72 @@ class TestOverview(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRemoteAndRemovable(unittest.TestCase):
+    """网络盘/U 盘必须排除，否则遍历会卡死或扫到拔出的盘"""
+
+    class _Part:
+        def __init__(self, dev, mnt, fs, opts):
+            self.device, self.mountpoint, self.fstype, self.opts = dev, mnt, fs, opts
+
+    def _run(self, include_removable=False):
+        from unittest.mock import patch
+        fake = [self._Part("C://", "C://", "NTFS", "rw,fixed"),
+                self._Part("Z://", "Z://", "NTFS", "rw,remote"),
+                self._Part("Y://", "Y://", "cifs", "rw"),
+                self._Part("F://", "F://", "FAT32", "rw,removable")]
+        with patch("psutil.disk_partitions", return_value=fake), \
+                patch("psutil.disk_usage") as du:
+            du.return_value.total = 100
+            du.return_value.used = 40
+            du.return_value.free = 60
+            du.return_value.percent = 40
+            return [d["mount"] for d in da.DiskAnalyzer.overview(include_removable)]
+
+    def test_skip_remote(self):
+        mounts = self._run()
+        self.assertIn("C://", mounts)
+        self.assertNotIn("Z://", mounts)
+        self.assertNotIn("Y://", mounts)
+
+    def test_removable_optional(self):
+        self.assertNotIn("F://", self._run())
+        self.assertIn("F://", self._run(include_removable=True))
+
+
+class TestPatternPath(unittest.TestCase):
+    """开发缓存里的通配路径（如 WSL 的 Packages\\*\\LocalState\\ext4.vhdx）要能展开"""
+
+    def test_expand_file_in_wildcard_dir(self):
+        with tempfile.TemporaryDirectory() as base:
+            pkg = os.path.join(base, "Packages")
+            target = os.path.join(pkg, "Ubuntu_abc", "LocalState")
+            os.makedirs(target)
+            vhdx = os.path.join(target, "ext4.vhdx")
+            with open(vhdx, "wb") as f:
+                f.write(b"0")
+            got = da._expand_pattern_path(os.path.join(pkg, "*", "LocalState", "ext4.vhdx"))
+            self.assertEqual(got, [vhdx])
+
+    def test_expand_missing_returns_empty(self):
+        with tempfile.TemporaryDirectory() as base:
+            self.assertEqual(da._expand_pattern_path(os.path.join(base, "nope", "*.bin")), [])
+
+
+class TestRecycleNotAutoCleaned(unittest.TestCase):
+    """回收站不可恢复，必须标记为需单独确认，不能混进一键清理"""
+
+    def test_recycle_marked_manual(self):
+        with tempfile.TemporaryDirectory() as base:
+            rb = os.path.join(base, "$Recycle.Bin")
+            os.makedirs(rb)
+            with open(os.path.join(rb, "a.bin"), "wb") as f:
+                f.write(b"x" * 10)
+            analyzer = da.DiskAnalyzer()
+            with unittest.mock.patch.object(da.DiskAnalyzer, "_fixed_drives", return_value=[base]):
+                items = analyzer._scan_system(None)
+        rb_items = [i for i in items if i["key"] == "recycle_bin"]
+        self.assertTrue(rb_items)
+        self.assertIn("规则清理", rb_items[0]["action_text"])   # 不参与一键清理
+        self.assertIn("不可恢复", rb_items[0]["detail"])        # 风险如实告知

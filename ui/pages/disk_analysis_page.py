@@ -11,6 +11,7 @@
 """
 
 import os
+import subprocess
 import threading
 
 from PySide6.QtCore import Qt, Signal
@@ -44,6 +45,8 @@ class DiskAnalysisPage(QWidget):
         self.cancel_event = None
         self.result = {}
         self._busy = False
+        self._disk_mounts = []
+        self._disk_rows = {}
         self.setup_ui()
 
         self.progress.connect(self._on_progress)
@@ -152,40 +155,67 @@ class DiskAnalysisPage(QWidget):
         self._fill_disks(data)
 
     def _fill_disks(self, overview):
-        while self.disk_layout.count():
-            item = self.disk_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        if not overview:
-            self.disk_layout.addWidget(QLabel("未读取到磁盘信息"))
-            return
-        for d in overview:
-            row = QHBoxLayout()
-            label = QLabel(f"{d['mount']}")
-            label.setMinimumWidth(52)
-            row.addWidget(label)
+        """磁盘行只创建一次，刷新时只更新数值。
 
-            bar = QProgressBar()
-            bar.setRange(0, 1000)
+        早期版本每次刷新都重建整行，子布局里的控件不随 takeAt 销毁，
+        反复扫描会持续残留 QLabel/QProgressBar（实测 10 次刷新涨到 69 个控件）。
+        """
+        mounts = [d["mount"] for d in overview]
+        if mounts != self._disk_mounts:
+            self._clear_disks()
+            self._disk_mounts = mounts
+            if not overview:
+                self.disk_layout.addWidget(QLabel("未读取到磁盘信息"))
+            for d in overview:
+                row = QHBoxLayout()
+                label = QLabel(d["mount"])
+                label.setMinimumWidth(52)
+                row.addWidget(label)
+
+                bar = QProgressBar()
+                bar.setRange(0, 1000)
+                bar.setTextVisible(True)
+                bar.setFixedHeight(18)
+                row.addWidget(bar, 1)
+
+                free = QLabel()
+                free.setMinimumWidth(110)
+                row.addWidget(free)
+
+                self.disk_layout.addLayout(row)
+                self._disk_rows[d["mount"]] = (bar, free)
+
+        for d in overview:
+            bar, free = self._disk_rows[d["mount"]]
             bar.setValue(int(d["percent"] * 10))
-            bar.setTextVisible(True)
             bar.setFormat(
                 f"{format_size(d['used'])} / {format_size(d['total'])}（{d['percent']:.0f}%）"
             )
-            bar.setFixedHeight(18)
-            if d["percent"] >= 90:
-                StyleHelper.set_progress_type(bar, "memory-high")
-            elif d["percent"] >= 75:
-                StyleHelper.set_progress_type(bar, "memory-medium")
-            else:
-                StyleHelper.set_progress_type(bar, "memory-low")
-            row.addWidget(bar, 1)
+            free.setText(f"剩余 {format_size(d['free'])}")
+            style = ("memory-high" if d["percent"] >= 90
+                     else "memory-medium" if d["percent"] >= 75 else "memory-low")
+            if bar.property("progressType") != style:
+                StyleHelper.set_progress_type(bar, style)
 
-            free = QLabel(f"剩余 {format_size(d['free'])}")
-            free.setMinimumWidth(110)
-            row.addWidget(free)
-            self.disk_layout.addLayout(row)
+    def _clear_disks(self):
+        """销毁磁盘行（含子布局里的控件，避免遗留）"""
+        while self.disk_layout.count():
+            item = self.disk_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+                continue
+            sub = item.layout()
+            if sub is not None:
+                while sub.count():
+                    child = sub.takeAt(0)
+                    cw = child.widget()
+                    if cw is not None:
+                        cw.setParent(None)
+                        cw.deleteLater()
+                sub.deleteLater()
+        self._disk_rows = {}
 
     # --------------------------------------
     # 扫描
@@ -247,9 +277,12 @@ class DiskAnalysisPage(QWidget):
         manual = format_size(result.get("total_manual", 0))
         notice = format_size(result.get("total_notice", 0))
         flag = "（已停止，结果为部分数据）" if result.get("cancelled") else ""
+        has_recycle = any("recycle_bin" in f.get("rule_keys", [])
+                          for f in result.get("findings", []))
+        tail = "；回收站需到「规则清理」页单独清空" if has_recycle else ""
         self.status_label.setText(
             f"✅ 分析完成{flag}：可一键释放约 {reclaim}；另有 {manual} 需手动清理、"
-            f"{notice} 属提示项（需自行判断）；耗时 {result.get('elapsed', 0):.1f} 秒"
+            f"{notice} 属提示项（需自行判断）{tail}；耗时 {result.get('elapsed', 0):.1f} 秒"
         )
         StyleHelper.set_label_type(self.status_label, "success")
         self.progress_bar.setValue(100)
@@ -303,9 +336,18 @@ class DiskAnalysisPage(QWidget):
             if os.path.isdir(path):
                 os.startfile(path)
             elif os.path.isfile(path):
-                os.system(f'explorer /select,"{path}"')
+                # 不用 os.system 拼接；路径含引号/换行会引起 explorer 参数歧义，
+                # 这种情况退化为打开所在目录，避免任何命令解析风险。
+                if any(c in path for c in ('"', "\r", "\n")):
+                    parent = os.path.dirname(path)
+                    if parent and os.path.isdir(parent):
+                        os.startfile(parent)
+                else:
+                    subprocess.Popen(["explorer.exe", f'/select,"{path}"'])
             else:
-                os.startfile(os.path.dirname(path) or path)
+                parent = os.path.dirname(path)
+                if parent and os.path.isdir(parent):
+                    os.startfile(parent)
         except OSError as e:
             QMessageBox.warning(self, "打开失败", f"无法打开：{path}\n{e}")
 
@@ -313,8 +355,14 @@ class DiskAnalysisPage(QWidget):
     # 清理
     # --------------------------------------
     def _cleanable_findings(self):
+        """可交给清理引擎的项目。
+
+        刻意排除回收站：清空回收站不可恢复，与「送回收站可还原」的承诺冲突，
+        必须让用户到「规则清理」页单独确认。
+        """
         return [f for f in self.result.get("findings", [])
-                if f.get("risk", 2) <= 1 and f.get("rule_keys")]
+                if f.get("risk", 2) <= 1 and f.get("rule_keys")
+                and "recycle_bin" not in f["rule_keys"]]
 
     def _cleanable_keys(self):
         keys = []
@@ -339,7 +387,8 @@ class DiskAnalysisPage(QWidget):
         reply = QMessageBox.question(
             self, "确认清理",
             f"将清理 {len(findings)} 类可释放项，约 {format_size(total)}：\n\n{lines}{more}\n\n"
-            "默认删除到回收站，可还原。是否继续？",
+            "删除方式：送回收站（可还原）。\n"
+            "回收站本身不会被清空——需要清空请到「规则清理」页单独确认。\n\n是否继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )

@@ -21,6 +21,7 @@ import os
 import json
 import time
 import ctypes
+import threading
 import subprocess
 from ctypes import wintypes
 
@@ -165,6 +166,9 @@ class CleanEngine:
 
     def __init__(self):
         self.rules = get_rules()
+        # 垃圾清理页的「规则清理」与「全盘分析」共用同一个引擎实例，
+        # 两边同时点清理会并发删同一批文件（送回收站也可能互相干扰），用锁串起来。
+        self._clean_lock = threading.Lock()
 
     # --------------------------------------
     # 规则辅助
@@ -399,6 +403,11 @@ class CleanEngine:
             return
 
     def clean(self, rule_keys, to_recycle=True, progress=None):
+        """执行清理（同一时刻只允许一个清理任务，避免两个页面并发处理同一批文件）"""
+        with self._clean_lock:
+            return self._clean_locked(rule_keys, to_recycle, progress)
+
+    def _clean_locked(self, rule_keys, to_recycle=True, progress=None):
         """执行清理，返回报告 dict"""
         report = {
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
