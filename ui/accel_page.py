@@ -31,6 +31,9 @@ from PySide6.QtWidgets import (
 from core import ip_optimizer
 from core.ip_optimizer import DOMAIN_GROUPS, IpCache
 from core import clash_kernel
+from core import dns_lists as dns_lists_mod
+from core.dns_filter import DEFAULT_BLOCKLIST
+from core.dns_rules import RuleSet
 from core.clash_kernel import KernelNotFound, MihomoKernel
 from core.geo import get_classifier
 from core.local_proxy import (
@@ -798,11 +801,38 @@ class AccelPage(QWidget):
         mode = self.mode_combo.currentData()
         return "rule" if mode == MODE_SMART else mode
 
+    def _ads_payload(self):
+        """把 DNS 页的过滤域名导出给内核（rule-provider 用）。
+
+        代理是 fake-ip 模式，内核会忽略上游 DNS 返回的 0.0.0.0 并回退公网 DNS，
+        所以「代理开着时的广告」只能靠内核规则拦。这里复用 DNS 页的规则集，
+        不用用户维护两份名单。
+        """
+        try:
+            lines, _counts = dns_lists_mod.merged_rules(self.config_manager.dns_lists)
+        except Exception as e:      # 列表缓存缺失/损坏不能拖累代理启动
+            logger.debug(f"读取 DNS 过滤列表失败，跳过内核广告规则：{e}")
+            lines = []
+        # 带上内置兜底名单：列表还没下载时也有基础覆盖
+        lines = list(DEFAULT_BLOCKLIST) + list(lines) \
+            + [r for r in (self.config_manager.dns_custom_rules or []) if r.strip()]
+        rules = RuleSet()
+        rules.extend(lines)
+        return rules.block_domains()
+
+    def _local_dns_port(self):
+        """DNS 过滤器实际监听端口（DNS 页可改，默认 53）。"""
+        try:
+            return int(self.config_manager.dns_port or 53)
+        except (TypeError, ValueError):
+            return 53
+
     def _local_dns_available(self):
-        """DNS 过滤器在跑时让内核 DNS 走本机 53，代理流量同样经过广告过滤。"""
+        """DNS 过滤器在跑时让内核 DNS 走本机，代理流量同样经过广告过滤。"""
         import socket
         try:
-            with socket.create_connection(("127.0.0.1", 53), timeout=0.3):
+            with socket.create_connection(("127.0.0.1", self._local_dns_port()),
+                                          timeout=0.3):
                 return True
         except OSError:
             return False
@@ -878,6 +908,10 @@ class AccelPage(QWidget):
                 allow_lan=(host == "0.0.0.0"),
                 clash_mode=self._clash_mode(),
                 local_dns=self._local_dns_available(),
+                local_dns_port=self._local_dns_port(),
+                # DNS 页开了过滤 → 内核也拦广告（fake-ip 下只能靠内核规则）
+                block_ads=bool(self.config_manager.dns_enabled),
+                ads_payload=self._ads_payload() if self.config_manager.dns_enabled else None,
                 accel_domains=accel_domains)
             kernel.start(config)
         except (KernelNotFound, RuntimeError) as e:

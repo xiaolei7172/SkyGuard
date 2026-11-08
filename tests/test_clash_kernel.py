@@ -114,7 +114,52 @@ class TestBuildConfig(unittest.TestCase):
 
     def test_local_dns(self):
         cfg = self.base(local_dns=True)
-        self.assertIn("127.0.0.1", cfg["dns"]["nameserver"])
+        self.assertTrue(cfg["dns"]["nameserver"][0].startswith("127.0.0.1"))
+
+    def test_local_dns_uses_real_port(self):
+        """DNS 端口可配：不能写死 127.0.0.1（默认 53）。"""
+        cfg = self.base(local_dns=True, local_dns_port=5353)
+        self.assertEqual(cfg["dns"]["nameserver"][0], "127.0.0.1:5353")
+
+    def test_local_dns_has_public_fallback(self):
+        """过滤器停掉时代理不能跟着断网：本地 DNS 之后要有公网兜底。"""
+        cfg = self.base(local_dns=True, local_dns_port=5353)
+        ns = cfg["dns"]["nameserver"]
+        self.assertGreaterEqual(len(ns), 2)
+        self.assertTrue(any(n.startswith("https://") for n in ns[1:]))
+
+    def test_default_nameserver_is_bare_ip(self):
+        """mihomo 的 default-nameserver 只认纯 IP，带端口会被忽略导致 DNS 全挂。"""
+        cfg = self.base(local_dns=True, local_dns_port=5353)
+        for ns in cfg["dns"]["default-nameserver"]:
+            self.assertNotIn(":", ns, f"default-nameserver 不能带端口: {ns}")
+            self.assertNotIn("127.0.0.1", ns,
+                             "default-nameserver 不能依赖本地过滤器（会自我循环）")
+
+    def test_block_ads_rule_first(self):
+        cfg = self.base(block_ads=True)
+        self.assertEqual(cfg["rules"][0], "GEOSITE,category-ads-all,REJECT")
+
+    def test_block_ads_off_by_default(self):
+        cfg = self.base()
+        self.assertFalse(any(r.startswith("GEOSITE,") for r in cfg["rules"]))
+
+    def test_ads_payload_creates_rule_provider(self):
+        """DNS 过滤列表以 rule-provider 形式带给内核（覆盖 geosite 缺口）。"""
+        cfg = self.base(ads_payload=["+.umeng.com", "cnzz.com"])
+        self.assertEqual(cfg["rules"][0], "RULE-SET,skyguard-ads,REJECT")
+        provider = cfg["rule-providers"]["skyguard-ads"]
+        self.assertEqual(provider["type"], "file")
+        self.assertEqual(provider["behavior"], "domain")
+        self.assertTrue(provider["path"].endswith("skyguard-ads.yaml"))
+        # 内部键要能被 start() 摘掉，不能写进 config.yaml
+        self.assertEqual(cfg["_ads_payload"], ["+.umeng.com", "cnzz.com"])
+
+    def test_ads_payload_alongside_geosite(self):
+        cfg = self.base(block_ads=True, ads_payload=["+.umeng.com"])
+        self.assertEqual(cfg["rules"][:2],
+                         ["RULE-SET,skyguard-ads,REJECT",
+                          "GEOSITE,category-ads-all,REJECT"])
 
     def test_empty_subscription_skipped(self):
         cfg = self.base(subscriptions=[{"name": "空", "url": " "}])

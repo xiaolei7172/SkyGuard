@@ -188,6 +188,24 @@ class RuleSet:
     def allow_count(self):
         return len(self._allow_suffix) + len(self._allow_regex)
 
+    def block_domains(self, limit=20000):
+        """导出可给内核 rule-provider（behavior: domain）用的拦截域名。
+
+        - 后缀规则转成 mihomo 的 '+.example.com'（含子域）
+        - 完整域名原样
+        - 例外（@@）与正则不导出：内核侧无法表达，硬塞会误伤
+        """
+        out = []
+        for suffix in sorted(self._suffix):
+            if suffix in self._allow_suffix:
+                continue
+            out.append("+." + suffix)
+        for exact in sorted(self._exact):
+            if exact in self._allow_exact:
+                continue
+            out.append(exact)
+        return out[:limit]
+
     def _hit_suffix(self, domain, suffix_set):
         if domain in suffix_set:
             return domain

@@ -222,7 +222,8 @@ def download_kernel(dest_dir=None, progress=None):
 # ----------------------------------------------------------------------
 def build_config(subscriptions, manual_nodes, rules, *, mixed_port=7890,
                  api_port=19090, api_secret=None, allow_lan=False,
-                 clash_mode="rule", local_dns=False, accel_domains=()):
+                 clash_mode="rule", local_dns=False, local_dns_port=None,
+                 block_ads=False, ads_payload=None, accel_domains=()):
     """生成 mihomo 配置 dict（可 yaml.safe_dump）。
 
     Args:
@@ -230,7 +231,14 @@ def build_config(subscriptions, manual_nodes, rules, *, mixed_port=7890,
         manual_nodes:  [ProxyNode] 手动节点
         rules:         SkyGuard 规则列表，映射为内核规则
         clash_mode:    rule / global / direct
-        local_dns:     True 时内核 DNS 走本机 127.0.0.1:53（DNS 过滤器）
+        local_dns:     True 时内核 DNS 走本机 DNS 过滤器（与 SkyGuard 的 DNS 页联动）
+        local_dns_port: 过滤器实际监听端口（默认 53）。端口可配，不能写死，
+                        否则用户把 DNS 改到 5353 后内核解析会全部失败
+        block_ads:     True 时在内核规则最前面拦广告（GEOSITE category-ads-all）。
+                       必须走内核规则：fake-ip 模式下内核会忽略上游返回的 0.0.0.0
+                       并回退到公网 DNS，光靠 DNS 上游拦不住代理流量里的广告
+        ads_payload:   DNS 页过滤列表导出的域名（'+.example.com' 形式），
+                       会和 GEOSITE 一起生效，覆盖 geosite 分类里没有的国内域名
         accel_domains: 优选加速域名集合（映射为 DIRECT，域名不变）
     """
     api_secret = api_secret or "".join(
@@ -276,6 +284,21 @@ def build_config(subscriptions, manual_nodes, rules, *, mixed_port=7890,
     policy = {"DIRECT": "DIRECT", "ACCEL": "DIRECT", "REJECT": "REJECT",
               "PROXY": group_name}
     rules_out = []
+    rule_providers = {}
+    if ads_payload:
+        # 用 rule-provider 承载 DNS 页的过滤域名：几万条也不占内存、
+        # 不拖慢匹配，且能覆盖 geosite 分类里没有的国内统计/广告域名。
+        name = "skyguard-ads"
+        rule_providers[name] = {
+            "type": "file",
+            "behavior": "domain",
+            "path": f"./rules/{name}.yaml",
+        }
+        rules_out.append(f"RULE-SET,{name},REJECT")
+    if block_ads:
+        # 广告/追踪域名最先拒绝：必须走内核规则，因为 fake-ip 模式下内核会
+        # 忽略 DNS 上游返回的 0.0.0.0（回退公网 DNS），光靠上游拦不住代理流量。
+        rules_out.append("GEOSITE,category-ads-all,REJECT")
     for r in rules or []:
         rtype = r.get("type")
         value = r.get("value", "")
@@ -325,8 +348,19 @@ def build_config(subscriptions, manual_nodes, rules, *, mixed_port=7890,
         "nameserver": ["https://223.5.5.5/dns-query", "https://doh.pub/dns-query"],
     }
     if local_dns:
-        dns["nameserver"] = ["127.0.0.1"]
-        dns["default-nameserver"] = ["127.0.0.1"]
+        # 带上真实端口：DNS 页把端口改成 5353 时，内核仍要能找到过滤器
+        port = int(local_dns_port or 53)
+        # 第一顺位走本机过滤器（广告过滤对代理流量也生效）；
+        # 后面留公网 DoH 兜底：过滤器被停掉/崩溃时代理还能解析域名，
+        # 不会因为「DNS 页停服务」把整个代理拖死。
+        dns["nameserver"] = [f"127.0.0.1:{port}",
+                             "https://223.5.5.5/dns-query",
+                             "https://doh.pub/dns-query"]
+        # default-nameserver 只能用纯 IP（mihomo 用它解析其它 DNS 的域名），
+        # 写 IP:端口会被忽略 → 内核 DNS 全挂、订阅拉不到节点。
+        # 这里也故意留公网 IP：不能让它依赖本地过滤器，否则过滤器没起来时
+        # 内核连"解析"都做不到（自己解析自己，死循环）。
+        dns["default-nameserver"] = ["223.5.5.5", "119.29.29.29"]
 
     return {
         "mixed-port": int(mixed_port),
@@ -342,9 +376,12 @@ def build_config(subscriptions, manual_nodes, rules, *, mixed_port=7890,
         "profile": {"store-selected": True},
         "dns": dns,
         "proxy-providers": providers,
+        "rule-providers": rule_providers,
         "proxies": proxies,
         "proxy-groups": [group],
         "rules": rules_out,
+        # 内部传递用，start() 会写成 rules/skyguard-ads.yaml 并从配置里摘掉
+        "_ads_payload": list(ads_payload or []),
     }
 
 
@@ -451,6 +488,29 @@ class MihomoKernel:
         os.makedirs(os.path.join(self.work_dir, "providers"), exist_ok=True)
         # 先把本机已有的 GeoIP 数据放到工作目录，避免内核卡在联网下载
         ensure_geo_files(self.work_dir, self.kernel_path)
+        # 广告域名列表落到工作目录，供 rule-provider（type: file）读取
+        payload = config_dict.pop("_ads_payload", None)
+        if payload:
+            rules_dir = os.path.join(self.work_dir, "rules")
+            os.makedirs(rules_dir, exist_ok=True)
+            ads_path = os.path.join(rules_dir, "skyguard-ads.yaml")
+            try:
+                with open(ads_path, "w", encoding="utf-8") as f:
+                    yaml.safe_dump({"payload": payload}, f,
+                                   allow_unicode=True, sort_keys=False)
+                logger.info(f"内核广告规则已写入：{len(payload)} 条 → {ads_path}")
+            except OSError as e:
+                logger.warning(f"写入内核广告规则失败，改为只按规则拦截：{e}")
+                config_dict["rules"] = [r for r in (config_dict.get("rules") or [])
+                                        if not r.startswith("RULE-SET,skyguard-ads")]
+        # 没有 geosite 数据时 GEOSITE 规则会让配置校验失败，先摘掉（退回纯 DNS 过滤）
+        if not os.path.exists(os.path.join(self.work_dir, "geosite.dat")):
+            rules = config_dict.get("rules") or []
+            dropped = [r for r in rules if str(r).startswith("GEOSITE,")]
+            if dropped:
+                config_dict["rules"] = [r for r in rules
+                                        if not str(r).startswith("GEOSITE,")]
+                logger.warning(f"缺少 geosite.dat，已跳过 {len(dropped)} 条 GEOSITE 规则")
         # 以进程对象为准，强制对齐 API 端口与 secret，避免配置侧另生成导致 401
         config_dict["secret"] = self.secret
         config_dict["external-controller"] = f"127.0.0.1:{self.api_port}"

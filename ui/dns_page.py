@@ -686,6 +686,18 @@ class DnsPage(QWidget):
         self._update_state()
 
     def on_stop(self):
+        # 代理（mihomo 内核）可能正把 DNS 指向本机，停掉后代理会解析不了域名
+        if self._proxy_depends_on_me():
+            answer = QMessageBox.question(
+                self, "停止 DNS 服务",
+                "检测到本地代理正在运行，且它的域名解析使用的是本机 DNS。\n\n"
+                "停止 DNS 后，代理会无法解析域名（网页打不开）。\n"
+                "建议先在「网络加速」页停止代理，或保持 DNS 运行。\n\n"
+                "仍要停止 DNS 服务吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         # 先恢复 DNS 再停服务，避免系统 DNS 指向已停止的本机端口
         if dns_takeover._load_backup():
             restored, _err = dns_takeover.restore_all()
@@ -693,6 +705,19 @@ class DnsPage(QWidget):
                 logger.info(f"停止 DNS 服务前已恢复系统 DNS: {restored}")
         self.filter.stop()
         self._update_state()
+
+    def _proxy_depends_on_me(self):
+        """本地代理是否在跑（端口可连通）。它会把内核 DNS 指向本机服务。"""
+        import socket
+        try:
+            port = int(self.config_manager.proxy_port or 7890)
+        except (TypeError, ValueError):
+            port = 7890
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return True
+        except OSError:
+            return False
 
     # ------------------------------------------------------------------
     # 上游管理

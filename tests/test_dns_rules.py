@@ -146,3 +146,36 @@ class TestCompileAndComments(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBlockDomainsExport(unittest.TestCase):
+    """DNS 规则 → 内核 rule-provider（behavior: domain）的域名导出。"""
+
+    def test_suffix_exported_with_plus(self):
+        rs = RuleSet()
+        rs.add_line("||ads.example.com^")
+        self.assertIn("+.ads.example.com", rs.block_domains())
+
+    def test_exact_exported_plain(self):
+        rs = RuleSet()
+        rs.add_line("0.0.0.0 tracker.example.net")
+        self.assertIn("tracker.example.net", rs.block_domains())
+
+    def test_allow_exception_not_exported(self):
+        rs = RuleSet()
+        rs.add_line("||example.com^")
+        rs.add_line("@@||ok.example.com^")
+        domains = rs.block_domains()
+        self.assertIn("+.example.com", domains)
+        self.assertNotIn("+.ok.example.com", domains)
+
+    def test_regex_not_exported(self):
+        rs = RuleSet()
+        rs.add_line("/ad[0-9]+\\.example\\.com/")
+        self.assertEqual(rs.block_domains(), [])
+
+    def test_limit_respected(self):
+        rs = RuleSet()
+        for i in range(30):
+            rs.add_line(f"||d{i}.example.com^")
+        self.assertEqual(len(rs.block_domains(limit=10)), 10)
