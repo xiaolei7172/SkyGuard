@@ -243,3 +243,5 @@ jobs:
           prerelease: false
           files: |
             ${{ env.APP_NAME }}-v${{ github.event.inputs.version }}-x64.zip
+
+# scope probe
