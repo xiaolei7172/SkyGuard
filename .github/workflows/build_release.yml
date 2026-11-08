@@ -5,6 +5,10 @@ permissions:
   packages: write
 
 on:
+  # 推送 v* 标签自动构建并发布（与手动触发等价）
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
@@ -37,6 +41,22 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: 解析发布参数
+        id: params
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = "0.0.0" }
+          $publish = "${{ github.event.inputs.should_publish }}"
+          if ("${{ github.event_name }}" -eq "push") { $publish = "true" }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "publish=$publish" >> $env:GITHUB_OUTPUT
+          echo "VERSION=$version" >> $env:GITHUB_ENV
+          Write-Host "发布版本: $version / 是否发布: $publish"
+
       - name: 设置Python
         uses: actions/setup-python@v5
         with:
@@ -66,19 +86,21 @@ jobs:
           Write-Host "✅ Python依赖安装完成"
 
       - name: 准备构建环境
+        id: prep
         run: |
           Write-Host "🔧 准备构建环境..."
 
           # 更新 app_config.py 中的版本号
           $appConfigPath = "config/app_config.py"
           if (Test-Path $appConfigPath) {
-            (Get-Content -Path $appConfigPath -Raw) -replace '"version": ".*?"', '"version": "${{ github.event.inputs.version }}"' | Set-Content -Path $appConfigPath -Encoding utf8
+            (Get-Content -Path $appConfigPath -Raw) -replace '"version": ".*?"', '"version": "${{ steps.params.outputs.version }}"' | Set-Content -Path $appConfigPath -Encoding utf8
             Write-Host "✅ 已更新 app_config.py 中的版本号"
           }
 
           # 提取应用名称
           $appName = python -c "from config.app_config import APP_INFO; print(APP_INFO['name'])"
           echo "APP_NAME=$appName" >> $env:GITHUB_ENV
+          echo "app_name=$appName" >> $env:GITHUB_OUTPUT
           Write-Host "✅ 应用名称: $appName"
 
           # 清理构建文件
@@ -189,14 +211,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: compilation-report-v${{ github.event.inputs.version }}
+          name: compilation-report-v${{ steps.params.outputs.version }}
           path: compilation-report.xml
           retention-days: 30
 
       - name: 压缩可执行文件目录
         run: |
           $dist_dir = "main.dist"
-          $zip_name = "$env:APP_NAME-v${{ github.event.inputs.version }}-x64"
+          $zip_name = "$env:APP_NAME-v${{ steps.params.outputs.version }}-x64"
           $zip_path = "$zip_name.zip"
 
           if (Test-Path $dist_dir) {
@@ -214,19 +236,19 @@ jobs:
 
       - name: 创建发布
         id: create_release
-        if: ${{ github.event.inputs.should_publish == 'true' }}
+        if: ${{ steps.params.outputs.publish == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ github.event.inputs.version }}
-          name: ${{ env.APP_NAME }} v${{ github.event.inputs.version }}
+          tag_name: v${{ steps.params.outputs.version }}
+          name: ${{ steps.prep.outputs.app_name }} v${{ steps.params.outputs.version }}
           body: |
             ### 🚀 更新日志
-            ${{ github.event.inputs.release_notes }}
+            ${{ github.event.inputs.release_notes || '详见仓库提交记录与 README。' }}
 
             ### 📥 安装说明
             1. 下载 zip 压缩包文件
             2. 解压到任意目录
-            3. 右键点击 `${{ env.APP_NAME }}.exe`，选择"以管理员身份运行"
+            3. 右键点击 `${{ steps.prep.outputs.app_name }}.exe`，选择"以管理员身份运行"
 
             ### ⚠️ 系统要求
             - Windows 10/11 x64
@@ -242,6 +264,4 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            ${{ env.APP_NAME }}-v${{ github.event.inputs.version }}-x64.zip
-
-# scope probe
+            ${{ steps.prep.outputs.app_name }}-v${{ steps.params.outputs.version }}-x64.zip
