@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-垃圾清理页面
+垃圾清理页面（两级页签）
 
-交互流程：扫描（预览） → 勾选 → 清理（默认送回收站）。
+页签一「规则清理」：扫描（预览） → 勾选 → 清理（默认送回收站），按声明式规则清理缓存与临时文件。
+页签二「全盘空间分析」：只读扫描整机可优化空间，找出真正占地方的东西。
+
 所有耗时操作在线程中执行，通过信号回主线程更新界面，避免卡死。
 """
 
@@ -14,16 +16,17 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QCheckBox,
     QTreeWidget, QTreeWidgetItem, QProgressBar, QMessageBox, QGroupBox,
-    QHeaderView,
+    QHeaderView, QTabWidget,
 )
 
 from utils.logger import logger
 from utils.clean_engine import get_clean_engine, format_size
 from ui.styles import StyleHelper
+from ui.pages.disk_analysis_page import DiskAnalysisPage
 
 
-class DiskCleanPage(QWidget):
-    """垃圾清理"""
+class RuleCleanPage(QWidget):
+    """按规则清理（原垃圾清理页）"""
 
     scan_progress = Signal(str, int)
     scan_done = Signal(dict)
@@ -332,3 +335,20 @@ class DiskCleanPage(QWidget):
         self.clean_btn.setEnabled(not busy and bool(self.checked_keys()))
         if msg:
             self.status_label.setText(msg)
+
+
+class DiskCleanPage(QWidget):
+    """垃圾清理（容器）：规则清理 + 全盘空间分析"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.tabs = QTabWidget()
+        self.rule_page = RuleCleanPage()
+        self.analysis_page = DiskAnalysisPage()
+        self.tabs.addTab(self.rule_page, "  规则清理  ")
+        self.tabs.addTab(self.analysis_page, "  全盘空间分析  ")
+        layout.addWidget(self.tabs)
