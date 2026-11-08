@@ -441,7 +441,8 @@ class LocalProxy:
                         remote.sendall(data)
                     counter["up"] += len(data)
                     self.stats.add_traffic(up=len(data))
-            except OSError as e:
+            except Exception as e:
+                # 节点密码/加密方式不对会抛 InvalidTag 之类的非 OSError，别让它炸线程
                 logger.debug(f"转发上行结束 {entry['host']}:{entry['port']}: {e}")
             finally:
                 done.set()
@@ -457,7 +458,7 @@ class LocalProxy:
                     client.sendall(data)
                     counter["down"] += len(data)
                     self.stats.add_traffic(down=len(data))
-            except OSError as e:
+            except Exception as e:
                 logger.debug(f"转发下行结束 {entry['host']}:{entry['port']}: {e}")
             finally:
                 done.set()
@@ -502,7 +503,12 @@ class LocalProxy:
                 _send(client, b"HTTP/1.1 200 Connection Established\r\n"
                              b"Proxy-Agent: SkyGuard\r\n\r\n")
             elif prelude:
-                _send(remote, prelude)
+                # 普通 HTTP 请求改写后会先发一段首部；节点隧道必须走加密 writer，
+                # 直接写裸 socket 会把明文灌进 SS/Trojan 流，对端解帧直接失败。
+                if writer is not None:
+                    writer.send(prelude)
+                else:
+                    _send(remote, prelude)
             client.settimeout(None)
             remote.settimeout(None)
             up, down = self._relay(client, remote, reader, writer, entry)

@@ -13,11 +13,14 @@ import socket
 import threading
 import time
 import unittest
+from unittest import mock
 
+import core.local_proxy as lp
 from core.local_proxy import (
     ACTION_ACCEL, ACTION_DIRECT, ACTION_PROXY, ACTION_REJECT,
     MODE_DIRECT, MODE_GLOBAL, MODE_RULE, LocalProxy, RuleEngine,
 )
+from core.proxy_nodes import ProxyNode
 
 
 def free_port():
@@ -271,6 +274,77 @@ class TestSocks5(ProxyTestBase):
         reply = sock.recv(10)
         self.assertEqual(reply[1], 0x07)
         sock.close()
+
+
+class _RecordingWriter:
+    """记录写入内容的假 writer（模拟 Shadowsocks 加密通道）。"""
+
+    def __init__(self):
+        self.chunks = []
+
+    def send(self, data):
+        self.chunks.append(bytes(data))
+        return len(data)
+
+    @property
+    def raw(self):
+        return b"".join(self.chunks)
+
+
+class _EmptyReader:
+    """立刻返回 EOF 的假 reader。"""
+
+    def recv(self, _n):
+        return b""
+
+
+class TestTunnelPlainHttp(unittest.TestCase):
+    """普通 HTTP（非 CONNECT）经节点隧道时，改写后的首部必须走加密 writer。
+
+    回归：之前实现直接 _send(remote, prelude) 把明文写进 SS/Trojan 加密流，
+    对端解帧 InvalidTag，导致所有 http:// 站点经节点访问全部失败。
+    """
+
+    def setUp(self):
+        self.port = free_port()
+        self.node = ProxyNode(name="tunnel-test", type="ss", server="127.0.0.1", port=1,
+                              password="p", cipher="aes-256-gcm")
+        self.writer = _RecordingWriter()
+        self.remote, self.peer = socket.socketpair()
+        self.proxy = LocalProxy(host="127.0.0.1", port=self.port, mode=MODE_GLOBAL,
+                                node_provider=lambda: self.node)
+        self.assertTrue(self.proxy.start(), self.proxy.bind_errors)
+        time.sleep(0.1)
+
+    def tearDown(self):
+        self.proxy.stop()
+        for sock in (self.remote, self.peer):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def test_prelude_goes_through_encrypted_writer(self):
+        with mock.patch.object(lp, "open_tunnel",
+                               return_value=(self.remote, _EmptyReader(), self.writer)):
+            sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            sock.settimeout(5)
+            sock.sendall(b"GET http://plain.test/x HTTP/1.1\r\n"
+                         b"Host: plain.test\r\nConnection: close\r\n\r\n")
+            time.sleep(0.4)
+            sock.close()
+
+        self.assertTrue(self.writer.raw.startswith(b"GET /x HTTP/1.1"),
+                        f"首部没有走 writer: {self.writer.raw[:80]!r}")
+        self.assertIn(b"Host: plain.test", self.writer.raw)
+
+        # 裸 socket 上不允许出现任何明文请求（否则就是泄进了加密流）
+        self.peer.settimeout(0.5)
+        try:
+            leaked = self.peer.recv(4096)
+        except socket.timeout:
+            leaked = b""
+        self.assertEqual(leaked, b"", f"明文泄漏到裸连接: {leaked[:80]!r}")
 
 
 if __name__ == "__main__":

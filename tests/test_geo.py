@@ -85,6 +85,18 @@ class TestGeoClassifier(unittest.TestCase):
         self.assertTrue(geo.should_direct("baidu.com"))       # 域名表仍然生效
         self.assertFalse(geo.should_direct("example.com"))    # 没有 IP 库时只能按国外
 
+    def test_cache_bounded_under_many_domains(self):
+        """长跑时唯一域名成千上万，缓存必须有上限，不能只涨不落。"""
+        geo = GeoClassifier(cache_max=64)
+        with patch.object(geo, "_getaddrinfo", return_value=["8.8.8.8"]):
+            for i in range(500):
+                geo.should_direct(f"site{i}.example")
+        self.assertLessEqual(len(geo._verdict), 64)
+        self.assertLessEqual(len(geo._dns), 64)
+        # 淘汰后判定依旧正确
+        with patch.object(geo, "_getaddrinfo", return_value=["1.0.1.1"]):
+            self.assertTrue(geo.should_direct("fresh-cn.test"))
+
     def test_lookup_speed(self):
         """单次判定要足够快，不能拖慢每条连接。"""
         self.assertGreater(self.geo.range_count, 1000)

@@ -79,8 +79,11 @@ CN_DOMAIN_SUFFIXES = (
 class GeoClassifier:
     """国内 / 国外判定器，带 DNS 结果缓存，避免每条连接都去解析。"""
 
+    # 长跑时唯一域名可能上万，缓存必须有上限，否则内存只涨不落
+    CACHE_MAX = 4096
+
     def __init__(self, data_path=None, user_path=None, dns_ttl=600, verdict_ttl=600,
-                 resolve_timeout=1.0, workers=6):
+                 resolve_timeout=1.0, workers=6, cache_max=None):
         self.user_path = user_path or os.path.join(
             os.path.expanduser("~"), ".skyguard", "china_ipv4.txt")
         self.bundled_path = data_path or os.path.join(
@@ -89,6 +92,7 @@ class GeoClassifier:
         self.dns_ttl = dns_ttl
         self.verdict_ttl = verdict_ttl
         self.resolve_timeout = resolve_timeout
+        self.cache_max = int(cache_max or self.CACHE_MAX)
 
         self._starts = []
         self._ends = []
@@ -192,6 +196,17 @@ class GeoClassifier:
         except OSError:
             return []
 
+    def _remember(self, cache, key, value, ttl):
+        """写入缓存并做容量控制：先清过期，仍超限就按插入顺序淘汰最老的四分之一。"""
+        if len(cache) >= self.cache_max and key not in cache:
+            now = time.time()
+            for k in [k for k, v in cache.items() if now - v[0] >= ttl]:
+                cache.pop(k, None)
+            if len(cache) >= self.cache_max:
+                for k in list(cache)[: max(1, self.cache_max // 4)]:
+                    cache.pop(k, None)
+        cache[key] = value
+
     def resolve(self, host, timeout=None):
         """返回 IP 列表；超时返回 None，解析失败返回 []。"""
         now = time.time()
@@ -204,7 +219,7 @@ class GeoClassifier:
 
         if ips is not None:
             with self._lock:
-                self._dns[host] = (now, ips)
+                self._remember(self._dns, host, (now, ips), self.dns_ttl)
         return ips
 
     # -- 对外结论 -----------------------------------------------------
@@ -232,11 +247,12 @@ class GeoClassifier:
         if ips is None:
             # 解析超时：先按国外走代理，30 秒后再试
             with self._lock:
-                self._verdict[host] = (now - self.verdict_ttl + 30, False)
+                self._remember(self._verdict, host,
+                               (now - self.verdict_ttl + 30, False), self.verdict_ttl)
             return False
         china = any(self.is_china_ip(ip) for ip in ips)
         with self._lock:
-            self._verdict[host] = (now, china)
+            self._remember(self._verdict, host, (now, china), self.verdict_ttl)
         return china
 
     def clear_cache(self):
