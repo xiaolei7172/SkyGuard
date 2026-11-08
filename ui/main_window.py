@@ -51,6 +51,7 @@ from ui.process_io_priority_manager import show_process_io_priority_manager
 from ui.components.custom_titlebar import CustomTitleBar
 from ui.floating_window import create_floating_window
 from ui.dns_page import DnsPage
+from ui.accel_page import AccelPage
 from ui.pages import DiskCleanPage, StartupPage
 from ui.styles import (
     ColorScheme,
@@ -693,6 +694,8 @@ class MainWindow(QWidget):
         self.startup_page = StartupPage()
         # DNS 过滤器选项卡（服务不随程序自动启动）
         self.dns_page = DnsPage(self.config_manager)
+        # 网络加速选项卡（代理 / 机场订阅 / GitHub-Steam 优选 IP）
+        self.accel_page = AccelPage(self.config_manager)
 
         # 添加选项卡
         self.tabs.addTab(status_tab, "  程序状态  ")
@@ -701,6 +704,7 @@ class MainWindow(QWidget):
         self.tabs.addTab(self.disk_clean_page, "  🧹 垃圾清理  ")
         self.tabs.addTab(self.startup_page, "  🚀 开机优化  ")
         self.tabs.addTab(self.dns_page, "  🛡 DNS 过滤器  ")
+        self.tabs.addTab(self.accel_page, "  🚀 网络加速  ")
         self.tabs.addTab(settings_tab, "  设置  ")
 
         # 首次切到这两个页时再加载数据，避免启动变慢
@@ -1849,6 +1853,10 @@ class MainWindow(QWidget):
         # 停止 DNS 过滤服务并恢复系统 DNS
         if getattr(self, "dns_page", None) is not None:
             self.dns_page.shutdown()
+
+        # 停止本地代理并还原系统代理
+        if getattr(self, "accel_page", None) is not None:
+            self.accel_page.shutdown()
 
         # 停止定时器（在主线程中处理）
         if hasattr(self, "update_timer") and self.update_timer:

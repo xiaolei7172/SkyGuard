@@ -9,7 +9,7 @@
 APP_INFO = {
     "name": "SkyGuard",                        # 应用名称（同时决定构建产物名 SkyGuard.exe）
     "author": "xiaolei7172",                   # 维护者（原作者 CassianVale，见 README 致谢）
-    "version": "1.1.0",                       # 版本号（会被GitHub Actions构建时替换）
+    "version": "1.2.0",                       # 版本号（会被GitHub Actions构建时替换）
     "description": "天幕进程优化工具 · 游戏反作弊进程管理",      # 应用描述
     "github_repo": "xiaolei7172/SkyGuard",         # GitHub仓库
     "github_api_url": "https://api.github.com/repos/xiaolei7172/SkyGuard/releases/latest",  # GitHub API URL
@@ -63,6 +63,22 @@ DEFAULT_CONFIG = {
             "memory": True,
             "temp": True
         }
+    },
+    "proxy": {
+        "enabled": False,                     # 本地代理服务默认不随程序启动
+        "mode": "rule",                       # rule=按规则 / global=全走节点 / direct=全直连
+        "host": "127.0.0.1",
+        "port": 7890,                         # 与 Clash 默认 mixed 端口一致，便于习惯迁移
+        "allow_lan": False,                   # True 时监听 0.0.0.0，局域网可用
+        "set_system_proxy": True,             # 启动代理时顺带接管系统代理
+        "selected_node": "",                  # 选中节点的 uid（空表示没有节点）
+        "rules": [],                          # 空列表表示使用内置默认规则
+        "accel_groups": {                     # 优选 IP 覆盖范围
+            "github": True,
+            "steam": True
+        },
+        "extra_domains": [],                  # 额外需要优选的域名
+        "top_n": 3                            # 每个域名保留几个优选 IP
     },
     "dns_filter": {
         "enabled": False,                     # DNS 过滤服务默认不随程序启动
