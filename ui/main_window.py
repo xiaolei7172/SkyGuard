@@ -49,6 +49,7 @@ from utils import (
 
 from ui.process_io_priority_manager import show_process_io_priority_manager
 from ui.components.custom_titlebar import CustomTitleBar
+from ui.floating_window import create_floating_window
 from ui.pages import DiskCleanPage, StartupPage
 from ui.styles import (
     ColorScheme,
@@ -94,6 +95,9 @@ class MainWindow(QWidget):
         # 自定义标题栏最小化相关
         self.is_custom_minimized = False
         self.original_geometry = None
+
+        # 桌面悬浮窗（按配置在 load_settings 里决定是否创建）
+        self.floating_window = None
 
         # 初始化内存清理管理器
         self.memory_cleaner = get_memory_cleaner()
@@ -481,6 +485,35 @@ class MainWindow(QWidget):
         notify_group.setLayout(notify_layout)
         settings_layout.addWidget(notify_group)
 
+        # 桌面悬浮窗设置
+        floating_group = QGroupBox("桌面悬浮窗")
+        floating_layout = QVBoxLayout()
+
+        self.floating_checkbox = QCheckBox("显示桌面悬浮窗（网速 / CPU / 内存 / 温度）")
+        self.floating_checkbox.stateChanged.connect(self.toggle_floating_window)
+        floating_layout.addWidget(self.floating_checkbox)
+
+        floating_interval_layout = QHBoxLayout()
+        floating_interval_layout.addWidget(QLabel("刷新间隔:"))
+        self.floating_interval_spinbox = QSpinBox()
+        self.floating_interval_spinbox.setRange(1, 5)
+        self.floating_interval_spinbox.setSuffix(" 秒")
+        self.floating_interval_spinbox.valueChanged.connect(self.update_floating_interval)
+        floating_interval_layout.addWidget(self.floating_interval_spinbox)
+        floating_interval_layout.addStretch()
+        floating_layout.addLayout(floating_interval_layout)
+
+        floating_info = QLabel(
+            "💡 拖动移动位置，双击锁定防误碰，滚轮调透明度，右键挑要显示的项\n"
+            "💡 温度需 LibreHardwareMonitor 运行或主板支持 ACPI 热区，读不到时显示 —"
+        )
+        floating_info.setWordWrap(True)
+        StyleHelper.set_label_type(floating_info, "info")
+        floating_layout.addWidget(floating_info)
+
+        floating_group.setLayout(floating_layout)
+        settings_layout.addWidget(floating_group)
+
         # 启动设置
         startup_group = QGroupBox("启动设置")
         startup_layout = QVBoxLayout()
@@ -708,6 +741,14 @@ class MainWindow(QWidget):
         self.monitor_action.setChecked(self.monitor.running)
         self.monitor_action.triggered.connect(self.toggle_process_monitor_from_tray)
         tray_menu.addAction(self.monitor_action)
+
+        # 桌面悬浮窗：网速/温度这类数字是"余光扫一眼"的需求，
+        # 不该逼用户点开主窗口
+        self.floating_action = QAction("桌面悬浮窗（网速/温度）", self)
+        self.floating_action.setCheckable(True)
+        self.floating_action.setChecked(self.config_manager.floating_enabled)
+        self.floating_action.triggered.connect(self.toggle_floating_window)
+        tray_menu.addAction(self.floating_action)
 
         tray_menu.addSeparator()
 
@@ -1129,6 +1170,20 @@ class MainWindow(QWidget):
         self.notify_checkbox.setChecked(self.monitor.config_manager.show_notifications)
         self.notify_action.setChecked(self.monitor.config_manager.show_notifications)
 
+        # 加载悬浮窗设置并按其状态启动
+        # 加载期间屏蔽信号：setChecked 会触发 toggle → save_config，白白写盘一次
+        self.floating_checkbox.blockSignals(True)
+        self.floating_checkbox.setChecked(self.config_manager.floating_enabled)
+        self.floating_checkbox.blockSignals(False)
+
+        self.floating_interval_spinbox.blockSignals(True)
+        self.floating_interval_spinbox.setValue(
+            max(1, int(round(self.config_manager.floating_interval)))
+        )
+        self.floating_interval_spinbox.blockSignals(False)
+
+        self._apply_floating_state()
+
         # 更新自启动设置
         self.startup_checkbox.setChecked(self.monitor.config_manager.auto_start)
         self.startup_action.setChecked(self.monitor.config_manager.auto_start)
@@ -1419,6 +1474,62 @@ class MainWindow(QWidget):
     def toggle_process_monitor_from_tray(self):
         """从托盘菜单切换进程监控开关"""
         self._toggle_process_monitor(from_tray=True)
+
+    # ------------------------------------------------------------------
+    # 桌面悬浮窗
+    # ------------------------------------------------------------------
+    def toggle_floating_window(self, state):
+        """开关悬浮窗。
+
+        托盘 QAction 的 triggered 传 bool，QCheckBox 的 stateChanged 传
+        int（0/2），这里统一按真假处理，两个入口可以共用一个槽。
+        """
+        enabled = bool(state)
+        self.config_manager.set_floating_enabled(enabled)
+        self._apply_floating_state()
+        self.sync_floating_action()
+        logger.debug(f"悬浮窗已{'开启' if enabled else '关闭'}")
+
+    def _apply_floating_state(self):
+        """按配置创建/显示或隐藏悬浮窗。"""
+        if self.config_manager.floating_enabled:
+            try:
+                if self.floating_window is None:
+                    self.floating_window = create_floating_window(
+                        self.config_manager, self.icon_path, self
+                    )
+                if self.floating_window is not None:
+                    self.floating_window.start()
+            except Exception as e:
+                logger.error(f"显示悬浮窗失败: {e}")
+        elif self.floating_window is not None:
+            # 关闭功能就停线程，别让它在后台每秒采一次
+            self.floating_window.stop()
+
+    def sync_floating_action(self):
+        """把配置状态同步回托盘菜单项与设置页复选框（不触发信号）。"""
+        enabled = bool(self.config_manager.floating_enabled)
+
+        action = getattr(self, "floating_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+        checkbox = getattr(self, "floating_checkbox", None)
+        if checkbox is not None and checkbox.isChecked() != enabled:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(enabled)
+            checkbox.blockSignals(False)
+
+    def update_floating_interval(self, value):
+        """设置页调整刷新间隔（秒）。"""
+        interval = max(0.5, float(value))
+        self.config_manager.set_floating_interval(interval)
+        if self.floating_window is not None and self.floating_window.isVisible():
+            # 重启采集线程让新间隔立刻生效
+            self.floating_window.stop()
+            self.floating_window.start()
 
     def open_config_dir(self):
         """打开配置目录"""
@@ -1732,6 +1843,11 @@ class MainWindow(QWidget):
         if self.monitor.running:
             self.monitor.stop_monitors()
             self.monitor.running = False
+
+        # 停掉悬浮窗的采集线程，否则 QThread 在解释器退出时会报警告
+        if getattr(self, "floating_window", None) is not None:
+            self.floating_window.shutdown()
+            self.floating_window = None
 
         # 停止定时器（在主线程中处理）
         if hasattr(self, "update_timer") and self.update_timer:

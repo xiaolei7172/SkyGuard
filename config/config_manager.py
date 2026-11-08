@@ -64,6 +64,16 @@ class ConfigManager:
         # I/O优先级设置
         self.io_priority_processes = self.default_config["io_priority"]["processes"].copy()
 
+        # 悬浮窗设置
+        floating = self.default_config["floating_window"]
+        self.floating_enabled = floating["enabled"]
+        self.floating_opacity = floating["opacity"]
+        self.floating_locked = floating["locked"]
+        self.floating_interval = floating["interval"]
+        self.floating_pos_x = floating["x"]
+        self.floating_pos_y = floating["y"]
+        self.floating_items = dict(floating["items"])
+
         # 确保配置目录存在
         self._ensure_directories()
 
@@ -225,6 +235,10 @@ class ConfigManager:
                     self.io_priority_processes = config_data["io_priority"]["processes"]
                     logger.debug(f"已从配置文件加载I/O优先级设置，进程数量: {len(self.io_priority_processes)}")
 
+                # 读取悬浮窗设置（旧版配置文件没有这一段，保持默认即可）
+                if isinstance(config_data.get("floating_window"), dict):
+                    self._load_floating_config(config_data["floating_window"])
+
                 logger.debug("配置文件加载成功")
                 return True
             except Exception as e:
@@ -267,6 +281,9 @@ class ConfigManager:
             # 加载I/O优先级默认设置
             self.io_priority_processes = self.default_config["io_priority"]["processes"].copy()
 
+            # 加载悬浮窗默认设置
+            self._load_floating_config(self.default_config["floating_window"])
+
             logger.debug("已创建并加载默认配置")
         except Exception as e:
             logger.error(f"创建默认配置文件失败: {str(e)}")
@@ -303,6 +320,15 @@ class ConfigManager:
                     "cooldown": self.memory_cleaner_cooldown,
                 },
                 "io_priority": {"processes": self.io_priority_processes},
+                "floating_window": {
+                    "enabled": self.floating_enabled,
+                    "opacity": self.floating_opacity,
+                    "locked": self.floating_locked,
+                    "interval": self.floating_interval,
+                    "x": self.floating_pos_x,
+                    "y": self.floating_pos_y,
+                    "items": self.floating_items,
+                },
             }
 
             # 保存到文件
@@ -314,6 +340,86 @@ class ConfigManager:
         except Exception as e:
             logger.error(f"保存配置文件失败: {str(e)}")
             return False
+
+    # ------------------------------------------------------------------
+    # 悬浮窗
+    # ------------------------------------------------------------------
+    def _load_floating_config(self, cfg):
+        """从配置字典读取悬浮窗设置，非法值回落到默认值。
+
+        旧版配置文件里没有 floating_window 段，这里所有取值都带默认兜底，
+        升级后不需要用户手动改配置。
+        """
+        default = self.default_config["floating_window"]
+
+        def as_bool(key):
+            value = cfg.get(key, default[key])
+            return bool(value) if isinstance(value, bool) else default[key]
+
+        def as_float(key, low, high):
+            try:
+                value = float(cfg.get(key, default[key]))
+            except (TypeError, ValueError):
+                return default[key]
+            return min(high, max(low, value))
+
+        self.floating_enabled = as_bool("enabled")
+        self.floating_locked = as_bool("locked")
+        self.floating_opacity = as_float("opacity", 0.5, 1.0)
+        self.floating_interval = as_float("interval", 0.5, 5.0)
+
+        for axis in ("x", "y"):
+            raw = cfg.get(axis, default[axis])
+            try:
+                value = int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                value = None
+            setattr(self, f"floating_pos_{axis}", value)
+
+        items = cfg.get("items")
+        merged = dict(default["items"])
+        if isinstance(items, dict):
+            for key, value in items.items():
+                if key in merged and isinstance(value, bool):
+                    merged[key] = value
+        self.floating_items = merged
+
+        logger.debug(f"已从配置文件加载悬浮窗设置: 启用={self.floating_enabled}")
+
+    def _save_floating(self):
+        """悬浮窗设置变更后落盘。写失败只记日志，不影响界面继续用。"""
+        if not self.save_config():
+            logger.warning("悬浮窗设置保存失败，本次修改仅在当前会话生效")
+
+    def set_floating_enabled(self, enabled):
+        self.floating_enabled = bool(enabled)
+        self._save_floating()
+
+    def set_floating_position(self, x, y):
+        self.floating_pos_x = int(x)
+        self.floating_pos_y = int(y)
+        self._save_floating()
+
+    def set_floating_opacity(self, opacity):
+        self.floating_opacity = min(1.0, max(0.5, float(opacity)))
+        self._save_floating()
+
+    def set_floating_locked(self, locked):
+        self.floating_locked = bool(locked)
+        self._save_floating()
+
+    def set_floating_interval(self, seconds):
+        self.floating_interval = min(5.0, max(0.5, float(seconds)))
+        self._save_floating()
+
+    def set_floating_item(self, key, enabled):
+        """key 为 download/upload/cpu/memory/temp 之一。"""
+        if key in self.floating_items:
+            self.floating_items[key] = bool(enabled)
+            self._save_floating()
+
+    def get_floating_item(self, key):
+        return bool(self.floating_items.get(key, True))
 
     def get_app_name(self):
         """获取应用名称"""

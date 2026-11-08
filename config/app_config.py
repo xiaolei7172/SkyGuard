@@ -48,6 +48,21 @@ DEFAULT_CONFIG = {
             {"name": "SGuard64.exe", "priority": 0},
             {"name": "ACE-Tray.exe", "priority": 0}
         ]
+    },
+    "floating_window": {
+        "enabled": False,                     # 悬浮窗默认关闭（首次启动不打扰）
+        "opacity": 0.9,                       # 卡片不透明度 0.6~1.0
+        "locked": False,                      # 锁定后不可拖动，防误碰
+        "interval": 1.0,                      # 刷新间隔（秒）
+        "x": None,                            # 位置，None 表示默认贴右下角
+        "y": None,
+        "items": {                            # 各显示项开关
+            "download": True,
+            "upload": True,
+            "cpu": True,
+            "memory": True,
+            "temp": True
+        }
     }
 }
 
