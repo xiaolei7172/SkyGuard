@@ -204,7 +204,7 @@ class TestCacheTtlBounds(unittest.TestCase):
         f.set_upstreams([up], 0)
         f.handle_query(build_query("clamp.test", query_id=1), client="-")
         with f._cache_lock:
-            _expires, _resp, min_ttl = next(iter(f._cache.values()))
+            _expires, _resp, min_ttl, _up = next(iter(f._cache.values()))
         self.assertEqual(min_ttl, 120)
 
 

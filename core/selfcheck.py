@@ -23,7 +23,7 @@ from core.clash_kernel import (
     KernelNotFound, MihomoKernel, is_real_node, provider_name,
 )
 from core.dns_filter import (
-    PROTO_UDP, QTYPE_A, DnsFilter, Upstream, build_query,
+    PROTO_DOH, PROTO_UDP, QTYPE_A, DnsFilter, Upstream, build_query,
 )
 from core.local_proxy import (
     MODE_GLOBAL, MODE_SMART, RuleEngine, LocalProxy,
@@ -176,14 +176,75 @@ def format_report(items, title=""):
 # ----------------------------------------------------------------------
 # DNS 自检
 # ----------------------------------------------------------------------
-def check_dns(port=None, upstream="223.5.5.5:53", timeout=8.0):
-    """验证 DNS 过滤器：监听、上游解析、本地应答、拦截、重写、缓存、日志。"""
+# 广告 / 追踪域名基准样本：用来判断上游是不是「去广告 DNS」。
+# 覆盖国内外主流广告与统计域名，命中率高、误判率低（这些域名本身没有正常用途）。
+AD_PROBE_DOMAINS = (
+    "doubleclick.net",
+    "pagead2.googlesyndication.com",
+    "pos.baidu.com",
+    "gdt.qq.com",
+    "umeng.com",
+    "cnzz.com",
+    "hm.baidu.com",
+)
+
+
+def make_upstream(spec):
+    """把 字符串 / dict / Upstream 统一成 Upstream。
+
+    字符串按内容猜协议：https:// 开头是 DoH，其余按 UDP（可带 :port）。
+    """
+    if isinstance(spec, Upstream):
+        return spec
+    if isinstance(spec, dict):
+        return Upstream(spec.get("name") or "自检上游",
+                        spec.get("proto") or PROTO_UDP,
+                        spec.get("address") or "")
+    text = str(spec or "").strip() or "223.5.5.5:53"
+    if text.lower().startswith(("http://", "https://")):
+        return Upstream("自检上游", PROTO_DOH, text)
+    return Upstream("自检上游", PROTO_UDP, text)
+
+
+def probe_ad_block(upstream, domains=None, timeout=6.0):
+    """直接问上游一批广告域名，判断它是否做了拦截。
+
+    返回 (blocked, allowed, failed)：
+      - blocked：返回 0.0.0.0 / :: 或 NXDOMAIN（这就是「去广告 DNS」的效果）
+      - allowed：正常返回了真实 IP
+      - failed：超时 / 报错
+    """
+    up = make_upstream(upstream)
+    blocked, allowed, failed = [], [], []
+    for domain in (domains or AD_PROBE_DOMAINS):
+        try:
+            data = up.query(build_query(domain, QTYPE_A, 0x7A7A), timeout=timeout)
+            rcode, _count, ips = parse_a_records(data)
+        except Exception as e:
+            failed.append((domain, f"{type(e).__name__}: {str(e)[:60]}"))
+            continue
+        if rcode == 3 or (ips and all(ip in ("0.0.0.0", "::") for ip in ips)):
+            blocked.append(domain)
+        elif ips:
+            allowed.append(domain)
+        else:
+            failed.append((domain, f"rcode={rcode}，无 A 记录"))
+    return blocked, allowed, failed
+
+
+def check_dns(port=None, upstream="223.5.5.5:53", timeout=8.0, ad_probe=True):
+    """验证 DNS 过滤器：监听、上游解析、上游广告拦截、本地应答、拦截、重写、缓存、日志。
+
+    upstream 可以是 "223.5.5.5:53"、DoH URL、或 {"name","proto","address"} 字典。
+    """
     items = []
+    up = make_upstream(upstream)
+    up_label = up.address
     listen_port = int(port or free_port(15353))
     flt = DnsFilter(listen_hosts=["127.0.0.1"], port=listen_port,
                     block_action="blackhole")
-    flt.upstream_timeout = min(4.0, timeout)
-    flt.set_upstreams([Upstream("自检上游", PROTO_UDP, upstream)], 0)
+    flt.upstream_timeout = min(6.0, timeout)
+    flt.set_upstreams([up], 0)
     flt.set_filter_sources(list_lines=[], custom_lines=["||selfcheck-block.invalid^"])
     flt.set_rewrites({"selfcheck.local": "10.20.30.40"})
 
@@ -200,19 +261,49 @@ def check_dns(port=None, upstream="223.5.5.5:53", timeout=8.0):
         # 1) 上游直连（不经过本机服务，用来判断是网络问题还是服务问题）
         started = time.perf_counter()
         try:
-            up = Upstream("自检上游", PROTO_UDP, upstream)
             raw = up.query(build_query("www.baidu.com", QTYPE_A, 0x1111),
-                           timeout=min(4.0, timeout))
+                           timeout=min(6.0, timeout))
             _rcode, _count, ips = parse_a_records(raw)
             if ips:
-                items.append(CheckItem("上游 DNS 直连", OK,
-                                       f"{upstream} 返回 {', '.join(ips[:2])}", _ms(started)))
+                items.append(CheckItem(f"上游 DNS 直连（{up.proto}）", OK,
+                                       f"{up_label} 返回 {', '.join(ips[:2])}",
+                                       _ms(started)))
             else:
-                items.append(CheckItem("上游 DNS 直连", FAIL,
-                                       f"{upstream} 无 A 记录应答", _ms(started)))
+                items.append(CheckItem(f"上游 DNS 直连（{up.proto}）", FAIL,
+                                       f"{up_label} 无 A 记录应答", _ms(started)))
         except Exception as e:
-            items.append(CheckItem("上游 DNS 直连", FAIL,
-                                   f"{upstream} 查询失败：{e}", _ms(started)))
+            items.append(CheckItem(f"上游 DNS 直连（{up.proto}）", FAIL,
+                                   f"{up_label} 查询失败：{e}", _ms(started)))
+
+        # 1b) 上游广告拦截能力（判断这个 DNS 本身是否去广告）
+        ad_blocked = []
+        if ad_probe:
+            started = time.perf_counter()
+            try:
+                blocked, allowed, failed = probe_ad_block(
+                    up, timeout=min(6.0, timeout))
+                ad_blocked = blocked
+                total = len(blocked) + len(allowed) + len(failed)
+                if blocked and len(blocked) * 2 >= total:
+                    sample = "、".join(blocked[:3])
+                    extra = f"，另有 {len(failed)} 个未应答" if failed else ""
+                    items.append(CheckItem(
+                        "上游广告拦截", OK,
+                        f"拦截 {len(blocked)}/{total} 个广告域名（{sample}…）{extra}",
+                        _ms(started)))
+                elif blocked:
+                    items.append(CheckItem(
+                        "上游广告拦截", OK,
+                        f"部分拦截 {len(blocked)}/{total}（"
+                        + "、".join(blocked[:4]) + "）", _ms(started)))
+                else:
+                    items.append(CheckItem(
+                        "上游广告拦截", SKIP,
+                        f"该上游未拦截任何广告域名（{len(allowed)} 个正常解析），"
+                        "属于普通递归 DNS，去广告需靠本地过滤器规则", _ms(started)))
+            except Exception as e:
+                items.append(CheckItem("上游广告拦截", SKIP,
+                                       f"检测失败：{e}", _ms(started)))
 
         # 2) 经本机服务解析国内域名
         started = time.perf_counter()
@@ -273,6 +364,37 @@ def check_dns(port=None, upstream="223.5.5.5:53", timeout=8.0):
         size = flt.stats.query_log.size
         items.append(CheckItem("查询日志记录", OK if size >= 4 else FAIL,
                                f"已记录 {size} 条查询"))
+
+        # 7) 上游拦截是否在本地链路与日志里被正确识别
+        if ad_blocked:
+            # 必须挑一个「本地过滤规则不会命中」的域名，否则本地规则先拦，
+            # 测的就不是上游黑洞识别了
+            candidates = [d for d in ad_blocked if not flt._match_block(d)]
+            domain = (candidates or ad_blocked)[0]
+            started = time.perf_counter()
+            try:
+                rcode, ips, _elapsed = query_local(listen_port, domain,
+                                                   timeout=timeout)
+                holed = rcode == 3 or (ips and set(ips) <= {"0.0.0.0", "::"})
+                entries = flt.stats.query_log.snapshot(
+                    result="upstream_blocked", limit=8)
+                tagged = any(e["domain"] == domain for e in entries)
+                if holed and tagged:
+                    detail = (f"{domain} 经本地服务返回 "
+                              f"{'NXDOMAIN' if rcode == 3 else ips[0]}，"
+                              "日志已标记「上游拦截」")
+                    status = OK
+                elif holed:
+                    detail = f"{domain} 已被拦，但日志未标记为「上游拦截」"
+                    status = SKIP
+                else:
+                    detail = f"{domain} 未被拦截（返回 {ips or rcode}）"
+                    status = FAIL
+                items.append(CheckItem("上游拦截在日志可见", status, detail,
+                                       _ms(started)))
+            except Exception as e:
+                items.append(CheckItem("上游拦截在日志可见", SKIP, str(e),
+                                       _ms(started)))
         if flt.bind_errors:
             items.append(CheckItem("监听告警", SKIP, "；".join(flt.bind_errors)))
     finally:

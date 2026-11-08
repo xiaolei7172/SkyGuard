@@ -20,6 +20,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
@@ -43,6 +44,7 @@ BLOCKLIST_SUBSCRIBE_URL = "https://anti-ad.net/hosts"
 RESULT_FILTERS = (
     ("全部", "all"),
     ("已拦截", "blocked"),
+    ("上游拦截", "upstream_blocked"),
     ("放行", "allow"),
     ("缓存命中", "cached"),
     ("重写", "rewrite"),
@@ -614,8 +616,12 @@ class DnsPage(QWidget):
                                  "<br><span style='color:#8c8c8c;'>正在自检（约 1~3 秒）…</span>")
 
         def work():
+            # 自检用「当前选优」的上游，这样结果直接回答「我配的 DNS 到底通不通、拦不拦广告」
+            ups = self.config_manager.dns_upstreams
+            sel = self.config_manager.dns_selected_upstream
+            upstream = ups[sel] if 0 <= sel < len(ups) else None
             try:
-                items = check_dns()
+                items = check_dns(upstream=upstream)
             except Exception as e:  # 自检本身异常也要回到界面
                 logger.warning(f"DNS 自检异常: {e}")
                 items = []
@@ -737,6 +743,9 @@ class DnsPage(QWidget):
         if not addr:
             QMessageBox.information(self, "添加上游", "请填写地址。")
             return
+        # 地址能说明协议时以地址为准：用户把 DoH 地址选成「UDP」是最常见的填错方式
+        if addr.lower().startswith(("http://", "https://")) and proto != "DoH":
+            proto = "DoH"
         if proto == "DoH" and not addr.lower().startswith(("http://", "https://")):
             QMessageBox.information(self, "添加上游",
                                     "DoH 地址必须是完整 URL，例如 https://dns.alidns.com/dns-query")
@@ -747,6 +756,11 @@ class DnsPage(QWidget):
         self.new_name.clear()
         self.new_addr.clear()
         self.reload_upstream_table()
+        # 服务已在运行时立即生效，否则用户会以为新上游没用上（必须重启才生效）
+        if self.filter.running:
+            self._sync_upstreams_to_filter()
+            self.upstream_hint.setText(
+                f"已添加 {name or addr}，已即时生效。建议点「测延迟」确认可达。")
 
     def on_del_upstream(self):
         row = self.upstream_table.currentRow()
@@ -761,6 +775,8 @@ class DnsPage(QWidget):
         self.config_manager.set_dns_config(
             upstreams=ups, selected_upstream=min(sel, len(ups) - 1))
         self.reload_upstream_table()
+        if self.filter.running:
+            self._sync_upstreams_to_filter()
 
     def on_set_default_upstream(self):
         row = self.upstream_table.currentRow()
@@ -820,6 +836,9 @@ class DnsPage(QWidget):
                 item = QTableWidgetItem(str(text))
                 if e["result"] == "blocked":
                     item.setForeground(Qt.GlobalColor.darkRed)
+                elif e["result"] == "upstream_blocked":
+                    # 上游 DNS 自己拦的（返回 0.0.0.0），用橙色与本地规则区分
+                    item.setForeground(QColor("#d46b08"))
                 elif e["result"] == "cached":
                     item.setForeground(Qt.GlobalColor.darkGray)
                 self.log_table.setItem(r, c, item)

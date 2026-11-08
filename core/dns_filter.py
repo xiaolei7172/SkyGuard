@@ -224,6 +224,9 @@ RESULT_BLOCKED = "blocked"
 RESULT_CACHED = "cached"
 RESULT_REWRITE = "rewrite"
 RESULT_FAIL = "fail"
+# 上游自己做了拦截（返回 0.0.0.0 / ::）。很多「去广告 DNS」用这种方式，
+# 不算本地规则命中，但用户必须能在日志里看到效果。
+RESULT_UPSTREAM_BLOCKED = "upstream_blocked"
 
 RESULT_LABELS = {
     RESULT_ALLOW: "放行",
@@ -231,6 +234,7 @@ RESULT_LABELS = {
     RESULT_CACHED: "缓存命中",
     RESULT_REWRITE: "重写",
     RESULT_FAIL: "失败",
+    RESULT_UPSTREAM_BLOCKED: "上游拦截",
 }
 
 
@@ -291,7 +295,7 @@ class QueryLog:
             clients[e["client"]] += 1
             domains[e["domain"]] += 1
             types[e["qtype"]] += 1
-            if e["result"] == RESULT_BLOCKED:
+            if e["result"] in (RESULT_BLOCKED, RESULT_UPSTREAM_BLOCKED):
                 blocked[e["domain"]] += 1
             hourly[time.localtime(e["ts"]).tm_hour] += 1
         return {
@@ -566,9 +570,18 @@ class DnsFilter:
         with self._cache_lock:
             cached = self._cache.get(cache_key)
         if cached and cached[0] > now:
-            _expires, resp, min_ttl = cached
+            _expires, resp, min_ttl, cached_up = cached
             self.stats.count_cache()
-            self.stats.query_log.add(client, name_l, qtype, RESULT_CACHED)
+            # 缓存里也可能是上游黑洞应答，分类保持与首次查询一致
+            if self._is_blackholed(resp, q_end):
+                rule = f"{cached_up or '上游 DNS'} 返回黑洞地址"
+                self.stats.count_blocked(name_l, rule, "上游 DNS 拦截（缓存）")
+                self.stats.query_log.add(client, name_l, qtype,
+                                         RESULT_UPSTREAM_BLOCKED, rule=rule,
+                                         upstream=cached_up)
+            else:
+                self.stats.query_log.add(client, name_l, qtype, RESULT_CACHED,
+                                         upstream=cached_up)
             # 把缓存期间流逝的秒数从各应答 TTL 里扣掉
             stored_at = _expires - min_ttl
             elapsed = max(0, now - stored_at)
@@ -586,9 +599,15 @@ class DnsFilter:
             self.stats.query_log.add(client, name_l, qtype, RESULT_FAIL,
                                      ms=elapsed_ms, upstream=used)
             return self._build_servfail(query_id, question)
-        self._store_cache(cache_key, resp, q_end)
-        self.stats.query_log.add(client, name_l, qtype, RESULT_ALLOW,
-                                 upstream=used, ms=elapsed_ms)
+        self._store_cache(cache_key, resp, q_end, used)
+        if self._is_blackholed(resp, q_end):
+            rule = f"{used or '上游 DNS'} 返回黑洞地址"
+            self.stats.count_blocked(name_l, rule, "上游 DNS 拦截")
+            self.stats.query_log.add(client, name_l, qtype, RESULT_UPSTREAM_BLOCKED,
+                                     rule=rule, upstream=used, ms=elapsed_ms)
+        else:
+            self.stats.query_log.add(client, name_l, qtype, RESULT_ALLOW,
+                                     upstream=used, ms=elapsed_ms)
         return self._patch_id(resp, query_id)
 
     def _query_upstreams(self, data):
@@ -738,7 +757,7 @@ class DnsFilter:
         return None
 
     # ---------------- 缓存 ----------------
-    def _store_cache(self, key, resp, q_end):
+    def _store_cache(self, key, resp, q_end, upstream=""):
         try:
             min_ttl, _ = self._walk_answers(resp, q_end, rewrite=False)
             if min_ttl is None:
@@ -749,7 +768,7 @@ class DnsFilter:
             with self._cache_lock:
                 if len(self._cache) >= self.CACHE_MAX:
                     self._cache.clear()
-                self._cache[key] = (time.monotonic() + min_ttl, resp, min_ttl)
+                self._cache[key] = (time.monotonic() + min_ttl, resp, min_ttl, upstream)
         except Exception:
             pass
 
@@ -760,6 +779,45 @@ class DnsFilter:
     def cache_size(self):
         with self._cache_lock:
             return len(self._cache)
+
+    def _is_blackholed(self, data, q_end):
+        """判断应答是否为「上游拦截」：有 A/AAAA 记录且全部是 0.0.0.0 / ::。
+
+        AdGuard DNS、去广告机场 DoH 这类上游不返回 NXDOMAIN，而是回 0.0.0.0，
+        客户端照样连不上广告域名。这种应答要在日志里算作拦截，否则用户
+        只看得到「放行」，完全看不出上游 DNS 的过滤有没有生效。
+
+        真实解析极少出现全 0 应答（0.0.0.0 不是可路由地址），误判风险很低。
+        """
+        if not data or len(data) < 12:
+            return False
+        _id, _flags, _qd, an, _ns, _ar = struct.unpack(">HHHHHH", data[:12])
+        if an <= 0:
+            return False
+        off = q_end
+        seen = False
+        for _ in range(an):
+            if off >= len(data):
+                return False
+            try:
+                _name, off = self._read_name(data, off)
+            except (ValueError, IndexError, struct.error):
+                return False
+            if off + 10 > len(data):
+                return False
+            rr_type, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+            off += 10
+            rdata = data[off:off + rdlen]
+            off += rdlen
+            if rr_type == QTYPE_A and rdlen == 4:
+                seen = True
+                if rdata != b"\x00\x00\x00\x00":
+                    return False
+            elif rr_type == QTYPE_AAAA and rdlen == 16:
+                seen = True
+                if rdata != b"\x00" * 16:
+                    return False
+        return seen
 
     def _walk_answers(self, data, q_end, rewrite, elapsed=0.0):
         """遍历应答记录。rewrite=True 时把 TTL 就地减去 elapsed。
