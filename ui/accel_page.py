@@ -14,6 +14,7 @@
 
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -26,9 +27,10 @@ from PySide6.QtWidgets import (
 
 from core import ip_optimizer
 from core.ip_optimizer import DOMAIN_GROUPS, IpCache
+from core.geo import get_classifier
 from core.local_proxy import (
     ACTION_ACCEL, ACTION_DIRECT, ACTION_PROXY, ACTION_REJECT,
-    DEFAULT_RULES, MODE_DIRECT, MODE_GLOBAL, MODE_RULE, RULE_TYPES,
+    DEFAULT_RULES, MODE_DIRECT, MODE_GLOBAL, MODE_RULE, MODE_SMART, RULE_TYPES,
     LocalProxy, format_bytes,
 )
 from core.proxy_connectors import probe_node
@@ -41,7 +43,8 @@ from utils import system_proxy
 from utils.logger import logger
 
 MODE_LABELS = (
-    ("规则模式（推荐）", MODE_RULE),
+    ("智能模式（国内直连 / 国外代理）", MODE_SMART),
+    ("仅按规则", MODE_RULE),
     ("全局代理", MODE_GLOBAL),
     ("全部直连", MODE_DIRECT),
 )
@@ -68,6 +71,9 @@ class AccelPage(QWidget):
         self._optimizing = False
         self._testing_nodes = False
         self._last_proxy_error = ""
+        self._stats_sig = None
+        self._status_cache = (0.0, None)
+        self.geo = get_classifier()
 
         self.proxy = LocalProxy(
             host=config_manager.proxy_host,
@@ -76,6 +82,7 @@ class AccelPage(QWidget):
             mode=config_manager.proxy_mode,
             node_provider=self._current_node,
             accel_ip_provider=self.ip_cache.best_for_suffix,
+            geo=self.geo,
         )
         self.proxy.stats.reset()
 
@@ -378,6 +385,7 @@ class AccelPage(QWidget):
 
         self.rule_table = QTableWidget(0, 3)
         self.rule_table.setHorizontalHeaderLabels(["类型", "匹配值", "动作"])
+        self.rule_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.rule_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.rule_table.verticalHeader().setVisible(False)
         self.rule_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -414,6 +422,18 @@ class AccelPage(QWidget):
         row2.addWidget(reset_btn)
         row2.addStretch()
         box.addLayout(row2)
+
+        geo_row = QHBoxLayout()
+        self.geo_label = QLabel(f"国内 IP 库：{self.geo.source}")
+        self.geo_label.setStyleSheet("color: #8c8c8c;")
+        self.geo_label.setWordWrap(True)
+        geo_row.addWidget(self.geo_label, 1)
+        update_db_btn = QPushButton("更新 IP 库")
+        update_db_btn.setToolTip("从 APNIC 重新下载中国大陆 IPv4 段，约 3MB，更新到用户目录")
+        update_db_btn.clicked.connect(self.on_update_geodb)
+        StyleHelper.set_button_type(update_db_btn, "default")
+        geo_row.addWidget(update_db_btn)
+        box.addLayout(geo_row)
 
         group.setLayout(box)
         return group
@@ -467,6 +487,9 @@ class AccelPage(QWidget):
     def on_start_proxy(self):
         port = self.listen_port.value()
         host = self.listen_host.currentText()
+        if self.proxy.running and (self.proxy.port != port or self.proxy.host != host):
+            # 端口/监听地址改了，先停掉旧监听再按新参数起
+            self.proxy.stop()
         self.proxy.host = host
         self.proxy.port = port
         self.proxy.set_mode(self.mode_combo.currentData())
@@ -516,17 +539,30 @@ class AccelPage(QWidget):
             QMessageBox.warning(self, "系统代理", msg)
         self.refresh_status()
 
-    def refresh_status(self):
-        info = system_proxy.current()
+    def refresh_status(self, force=False):
+        now = time.time()
+        if not force and self._status_cache[1] is not None and now - self._status_cache[0] < 2.0:
+            info = self._status_cache[1]
+        else:
+            info = system_proxy.current()
+            self._status_cache = (now, info)
         proxy_state = (f"系统代理：{info['server']}" if info["enabled"]
                        else "系统代理：未启用")
         node = self._current_node()
-        node_state = f"节点：{node.name}" if node else "节点：未选择（加速规则仍可用）"
+        if node:
+            node_state = f"节点：{node.name}"
+        elif self.proxy.engine.mode == MODE_SMART:
+            node_state = "节点：未选择（国外站点会直连兜底，建议加一条订阅）"
+        else:
+            node_state = "节点：未选择（加速规则仍可用）"
         self.status_detail.setText(f"{node_state}    |    {proxy_state}")
         self.sysproxy_btn.setText("取消系统代理" if system_proxy.is_pointing_to(self.proxy.port)
                                   else "设为系统代理")
 
     def refresh_stats(self):
+        # 页面不可见时不刷新，避免后台空转
+        if not self.isVisible():
+            return
         snap = self.proxy.stats.snapshot()
         self.stat_cards["total"].setText(str(snap["total"]))
         self.stat_cards["proxied"].setText(str(snap["proxied"]))
@@ -535,6 +571,13 @@ class AccelPage(QWidget):
         self.stat_cards["traffic"].setText(traffic)
 
         rows = snap["recent"]
+        # 数据没变化就不重建表格，避免每秒抢焦点、滚动条乱跳
+        head = rows[0] if rows else {}
+        sig = (snap["total"], snap["active"], len(rows), head.get("time"),
+               head.get("up"), head.get("down"), head.get("result"))
+        if sig == self._stats_sig:
+            return
+        self._stats_sig = sig
         self.conn_table.setRowCount(len(rows))
         for r, item in enumerate(rows):
             target = f"{item['host']}:{item['port']}"
@@ -865,6 +908,24 @@ class AccelPage(QWidget):
         self.config_manager.set_proxy_config(rules=[])
         self.proxy.set_rules(DEFAULT_RULES)
         self.refresh_rule_table()
+
+    def on_update_geodb(self):
+        self.geo_label.setText("正在从 APNIC 下载国内 IP 段…")
+
+        def work():
+            return self.geo.update_from_network()
+
+        def done(result):
+            segments, cidrs = result
+            self.geo_label.setText(f"国内 IP 库：{self.geo.source}")
+            self.accel_hint.setText(f"IP 库已更新：{segments} 个网段 / {cidrs} 条 CIDR")
+            self.proxy.set_geo(self.geo)
+
+        def failed(err):
+            self.geo_label.setText(f"国内 IP 库：{self.geo.source}")
+            QMessageBox.warning(self, "更新 IP 库", f"更新失败：{err}")
+
+        self._run(work, done, failed)
 
     # ------------------------------------------------------------------
     # 退出

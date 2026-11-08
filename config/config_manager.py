@@ -475,7 +475,7 @@ class ConfigManager:
         self.proxy_allow_lan = as_bool("allow_lan")
 
         mode = str(cfg.get("mode", default["mode"])).lower()
-        self.proxy_mode = mode if mode in ("rule", "global", "direct") else default["mode"]
+        self.proxy_mode = mode if mode in ("smart", "rule", "global", "direct") else default["mode"]
 
         host = str(cfg.get("host", default["host"])).strip()
         self.proxy_host = host or default["host"]

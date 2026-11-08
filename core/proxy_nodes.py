@@ -344,6 +344,8 @@ class NodeStore:
         self.path = path or default_store_path()
         self.subscriptions = []   # [{name, url, updated, nodes: [dict]}]
         self.manual = []          # [dict]
+        self._cache = None        # 节点对象列表缓存，改动时失效
+        self._index = {}
         self.load()
 
     # -- 读写 --------------------------------------------------------
@@ -361,6 +363,12 @@ class NodeStore:
                 self.manual = [m for m in manual if isinstance(m, dict)]
         except Exception as e:
             logger.warning(f"读取代理节点文件失败: {e}")
+        finally:
+            self._invalidate()
+
+    def _invalidate(self):
+        self._cache = None
+        self._index = {}
 
     def save(self):
         try:
@@ -375,11 +383,16 @@ class NodeStore:
 
     # -- 查询 --------------------------------------------------------
     def all_nodes(self):
+        """返回节点对象列表。结果缓存，代理每条连接都会调用，不能每次都重建。"""
+        if self._cache is not None:
+            return self._cache
         nodes = []
+        index = {}
         for m in self.manual:
             node = ProxyNode.from_dict(m)
             if node and node.supported:
                 nodes.append(node)
+                index.setdefault(node.uid, node)
         for sub in self.subscriptions:
             name = sub.get("name") or sub.get("url", "")
             for item in sub.get("nodes", []):
@@ -388,13 +401,15 @@ class NodeStore:
                     if not node.subscription:
                         node.subscription = name
                     nodes.append(node)
+                    index.setdefault(node.uid, node)
+        self._cache = nodes
+        self._index = index
         return nodes
 
     def find(self, uid):
-        for node in self.all_nodes():
-            if node.uid == uid:
-                return node
-        return None
+        if self._cache is None:
+            self.all_nodes()
+        return self._index.get(uid)
 
     def subscription_names(self):
         return [s.get("name") or s.get("url", "") for s in self.subscriptions]
@@ -413,6 +428,7 @@ class NodeStore:
                 break
         else:
             self.subscriptions.append(entry)
+        self._invalidate()
         self.save()
         return len(nodes)
 
@@ -423,6 +439,7 @@ class NodeStore:
             if s.get("url") != name_or_url and s.get("name") != name_or_url
         ]
         if len(self.subscriptions) != before:
+            self._invalidate()
             self.save()
             return True
         return False
@@ -434,15 +451,22 @@ class NodeStore:
             return False
         node.subscription = "手动添加"
         self.manual.append(node.to_dict())
+        self._invalidate()
         self.save()
         return True
 
     def remove_node(self, uid):
         """手动节点直接删除；订阅节点记录到隐藏列表，避免下次更新又回来。"""
         before = len(self.manual)
-        self.manual = [m for m in self.manual
-                       if (ProxyNode.from_dict(m).uid if ProxyNode.from_dict(m) else "") != uid]
+        kept = []
+        for item in self.manual:
+            node = ProxyNode.from_dict(item)
+            if node is not None and node.uid == uid:
+                continue
+            kept.append(item)
+        self.manual = kept
         if len(self.manual) != before:
+            self._invalidate()
             self.save()
             return True
         return False

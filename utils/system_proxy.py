@@ -151,5 +151,12 @@ def is_pointing_to(port, host="127.0.0.1"):
     info = current()
     if not info["enabled"]:
         return False
-    server = info["server"].replace("http=", "").replace("https=", "").strip()
-    return server in (f"{host}:{port}", f"http://{host}:{port}")
+    wanted = {f"{host}:{port}", f"http://{host}:{port}"}
+    # ProxyServer 可能是 "host:port"，也可能是 "http=h:p;https=h:p"
+    for part in str(info["server"]).split(";"):
+        part = part.strip()
+        if "=" in part:
+            part = part.split("=", 1)[1].strip()
+        if part in wanted:
+            return True
+    return False

@@ -572,6 +572,8 @@ class DnsPage(QWidget):
     # 状态刷新
     # ------------------------------------------------------------------
     def refresh_stats(self):
+        if not self.isVisible():
+            return
         snap = self.filter.stats.snapshot()
         self.stat_cards["total"].setText(str(snap["total"]))
         self.stat_cards["blocked"].setText(str(snap["blocked"]))

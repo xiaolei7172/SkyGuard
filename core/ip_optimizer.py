@@ -227,6 +227,15 @@ def optimize_domains(domains, port=443, top_n=3, max_workers=8, progress=None):
     counter = {"done": 0}
     lock = threading.Lock()
 
+    # 社区 hosts 源可能被墙，放到后台拉，拉不到就不等它，避免整个测速卡住
+    def load_community():
+        try:
+            community.update(fetch_community_hosts(timeout=5))
+        except Exception:
+            pass
+
+    threading.Thread(target=load_community, daemon=True).start()
+
     def work(domain):
         extra = community.get(domain)
         data = optimize_domain(domain, port=port, top_n=top_n, extra_ips=extra)
@@ -240,7 +249,6 @@ def optimize_domains(domains, port=443, top_n=3, max_workers=8, progress=None):
                 pass
         return data
 
-    community = fetch_community_hosts()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for data in pool.map(work, domains):
             results.append(data)

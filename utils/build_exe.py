@@ -192,6 +192,7 @@ cmd = [
     "--windows-console-mode=disable",  # 禁用控制台
     "--windows-icon-from-ico=" + icon_path,  # 设置图标
     "--include-data-dir=%s=assets/icon" % assets_icon_dir,  # 包含整个图标资源目录
+    "--include-data-dir=%s=data" % os.path.join(root_dir, "data"),  # 国内 IP 段库
     "--windows-uac-admin",  # 请求管理员权限
     "--remove-output",  # 在重新构建前移除输出目录
     

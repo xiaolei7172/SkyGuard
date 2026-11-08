@@ -125,6 +125,7 @@ jobs:
             --windows-icon-from-ico=$icon_path `
             --include-data-files=$icon_path=favicon.ico `
             --include-data-dir=assets/icon=assets/icon `
+            --include-data-dir=data=data `
             --windows-uac-admin `
             --remove-output `
             --enable-plugin=pyside6 `

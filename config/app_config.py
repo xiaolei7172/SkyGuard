@@ -9,7 +9,7 @@
 APP_INFO = {
     "name": "SkyGuard",                        # 应用名称（同时决定构建产物名 SkyGuard.exe）
     "author": "xiaolei7172",                   # 维护者（原作者 CassianVale，见 README 致谢）
-    "version": "1.2.0",                       # 版本号（会被GitHub Actions构建时替换）
+    "version": "1.3.0",                       # 版本号（会被GitHub Actions构建时替换）
     "description": "天幕进程优化工具 · 游戏反作弊进程管理",      # 应用描述
     "github_repo": "xiaolei7172/SkyGuard",         # GitHub仓库
     "github_api_url": "https://api.github.com/repos/xiaolei7172/SkyGuard/releases/latest",  # GitHub API URL
@@ -66,7 +66,7 @@ DEFAULT_CONFIG = {
     },
     "proxy": {
         "enabled": False,                     # 本地代理服务默认不随程序启动
-        "mode": "rule",                       # rule=按规则 / global=全走节点 / direct=全直连
+        "mode": "smart",                      # smart=国内直连国外代理 / rule=按规则 / global=全走节点 / direct=全直连
         "host": "127.0.0.1",
         "port": 7890,                         # 与 Clash 默认 mixed 端口一致，便于习惯迁移
         "allow_lan": False,                   # True 时监听 0.0.0.0，局域网可用

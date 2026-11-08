@@ -39,7 +39,8 @@ ACTION_ACCEL = "ACCEL"
 MODE_RULE = "rule"
 MODE_GLOBAL = "global"
 MODE_DIRECT = "direct"
-MODES = (MODE_RULE, MODE_GLOBAL, MODE_DIRECT)
+MODE_SMART = "smart"
+MODES = (MODE_SMART, MODE_RULE, MODE_GLOBAL, MODE_DIRECT)
 
 RULE_TYPES = ("domain-suffix", "domain", "domain-keyword", "domain-regex", "ip-cidr", "final")
 
@@ -90,12 +91,13 @@ def is_local_address(host):
 
 
 class RuleEngine:
-    """规则匹配，先匹配先返回。"""
+    """规则匹配，先匹配先返回。智能模式下 final 交给国内外判定。"""
 
-    def __init__(self, rules=None, mode=MODE_RULE):
+    def __init__(self, rules=None, mode=MODE_RULE, geo=None):
         self._lock = threading.RLock()
-        self.rules = []
+        self.rules = ()
         self.mode = mode if mode in MODES else MODE_RULE
+        self.geo = geo
         self.set_rules(rules if rules is not None else DEFAULT_RULES)
 
     def set_rules(self, rules):
@@ -124,12 +126,15 @@ class RuleEngine:
                     continue
             cleaned.append(entry)
         with self._lock:
-            self.rules = cleaned
+            self.rules = tuple(cleaned)
         return len(cleaned)
 
     def set_mode(self, mode):
         with self._lock:
             self.mode = mode if mode in MODES else MODE_RULE
+
+    def set_geo(self, geo):
+        self.geo = geo
 
     def match(self, host, port=0):
         """
@@ -139,9 +144,8 @@ class RuleEngine:
         if is_local_address(host):
             return ACTION_DIRECT, "本机/内网"
 
-        with self._lock:
-            mode = self.mode
-            rules = list(self.rules)
+        mode = self.mode
+        rules = self.rules
 
         if mode == MODE_GLOBAL:
             return ACTION_PROXY, "全局模式"
@@ -157,7 +161,7 @@ class RuleEngine:
         for rule in rules:
             rtype = rule["type"]
             if rtype == "final":
-                return rule["action"], "final"
+                break
             if ip is not None:
                 if rtype == "ip-cidr" and ip in rule["network"]:
                     return rule["action"], f"IP {rule['value']}"
@@ -175,6 +179,13 @@ class RuleEngine:
             elif rtype == "domain-regex":
                 if rule["regex"].search(host_l):
                     return rule["action"], rule["value"]
+
+        # 智能模式：显式规则都没命中，按国内外归属决定
+        if mode == MODE_SMART and self.geo is not None:
+            if self.geo.should_direct(host_l):
+                return ACTION_DIRECT, "国内直连"
+            return ACTION_PROXY, "国外走代理"
+
         return ACTION_DIRECT, "默认直连"
 
 
@@ -265,19 +276,21 @@ class LocalProxy:
     """混合端口代理服务。"""
 
     def __init__(self, host="127.0.0.1", port=7890, rules=None, mode=MODE_RULE,
-                 node_provider=None, accel_ip_provider=None):
+                 node_provider=None, accel_ip_provider=None, geo=None):
         self.host = host
         self.port = int(port)
-        self.engine = RuleEngine(rules, mode)
+        self.engine = RuleEngine(rules, mode, geo=geo)
         self.stats = ProxyStats()
         self.node_provider = node_provider          # () -> ProxyNode | None
         self.accel_ip_provider = accel_ip_provider  # (host) -> ip | None
-        self.connect_timeout = 10.0
+        self.connect_timeout = 8.0
 
         self._server = None
         self._thread = None
         self._running = False
         self._stop_event = threading.Event()
+        self._conns = set()
+        self._conns_lock = threading.Lock()
         self.bind_errors = []
 
     # -- 生命周期 ----------------------------------------------------
@@ -319,6 +332,16 @@ class LocalProxy:
             except Exception:
                 pass
             self._server = None
+        # 主动断开在途连接，避免停止后线程还挂在 recv 上
+        with self._conns_lock:
+            conns = list(self._conns)
+            self._conns.clear()
+        for sock in conns:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+                sock.close()
+            except Exception:
+                pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
@@ -326,6 +349,9 @@ class LocalProxy:
 
     def set_mode(self, mode):
         self.engine.set_mode(mode)
+
+    def set_geo(self, geo):
+        self.engine.set_geo(geo)
 
     def set_rules(self, rules):
         return self.engine.set_rules(rules)
@@ -345,6 +371,8 @@ class LocalProxy:
                 continue
             except OSError:
                 break
+            with self._conns_lock:
+                self._conns.add(client)
             threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
 
     def _handle_client(self, client):
@@ -360,6 +388,8 @@ class LocalProxy:
         except Exception as e:
             logger.debug(f"代理连接异常: {e}")
         finally:
+            with self._conns_lock:
+                self._conns.discard(client)
             try:
                 client.close()
             except Exception:
@@ -371,12 +401,17 @@ class LocalProxy:
         Returns:
             (socket, reader, writer, node_name)
         """
+        fallback_name = ""
         if action == ACTION_PROXY:
             node = self.node_provider() if self.node_provider else None
-            if node is None:
+            if node is not None:
+                sock, reader, writer = open_tunnel(node, host, port, timeout=self.connect_timeout)
+                return sock, reader, writer, node.name
+            if self.engine.mode not in (MODE_SMART, MODE_RULE):
                 raise ConnectorError("未选择代理节点")
-            sock, reader, writer = open_tunnel(node, host, port, timeout=self.connect_timeout)
-            return sock, reader, writer, node.name
+            # 智能 / 规则模式下没有节点时直连兜底，别把用户的网直接掐了
+            logger.debug(f"没有可用节点，{host} 回退直连")
+            fallback_name = "无节点→直连"
 
         target = host
         if action == ACTION_ACCEL and self.accel_ip_provider:
@@ -385,7 +420,9 @@ class LocalProxy:
                 target = ip
         sock = socket.create_connection((target, port), timeout=self.connect_timeout)
         sock.settimeout(None)
-        return sock, None, None, ""
+        if fallback_name:
+            return sock, None, None, fallback_name
+        return sock, None, None, "优选IP" if action == ACTION_ACCEL else ""
 
     def _relay(self, client, remote, reader, writer, entry):
         """双向转发，返回 (上行字节, 下行字节)。"""
