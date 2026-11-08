@@ -32,7 +32,7 @@ from core.clash_kernel import KernelNotFound, MihomoKernel
 from core.geo import get_classifier
 from core.local_proxy import (
     ACTION_ACCEL, ACTION_DIRECT, ACTION_PROXY, ACTION_REJECT,
-    DEFAULT_RULES, MODE_DIRECT, MODE_GLOBAL, MODE_RULE, MODE_SMART, RULE_TYPES,
+    DEFAULT_RULES, MODE_DIRECT, MODE_GLOBAL, MODE_RULE, MODE_SMART,
     LocalProxy, format_bytes,
 )
 from core.proxy_connectors import probe_node
@@ -45,16 +45,26 @@ from utils import system_proxy
 from utils.logger import logger
 
 MODE_LABELS = (
-    ("智能模式（国内直连 / 国外代理）", MODE_SMART),
+    ("智能分流", MODE_SMART),
     ("仅按规则", MODE_RULE),
     ("全局代理", MODE_GLOBAL),
     ("全部直连", MODE_DIRECT),
 )
 ACTION_LABELS = (
     ("加速直连", ACTION_ACCEL),
-    ("直接连接", ACTION_DIRECT),
-    ("走代理节点", ACTION_PROXY),
+    ("直连", ACTION_DIRECT),
+    ("走代理", ACTION_PROXY),
     ("拒绝", ACTION_REJECT),
+)
+
+# 规则类型：界面显示短中文标签，存储仍是内核识别的英文类型
+RULE_TYPE_LABELS = (
+    ("域名后缀", "domain-suffix"),
+    ("完整域名", "domain"),
+    ("域名关键字", "domain-keyword"),
+    ("域名正则", "domain-regex"),
+    ("IP 段", "ip-cidr"),
+    ("兜底", "final"),
 )
 
 
@@ -164,12 +174,25 @@ class AccelPage(QWidget):
 
     # -- 服务控制 ----------------------------------------------------
     def _shrinkable_combo(self, combo):
-        """下拉框允许收窄：只把最小宽度降到 64px，宽窗口下仍按内容自然展开。
+        """下拉框允许收窄，窄窗口时不会把页面撑出横向滚动。
 
-        DNS 页与代理页保持一致的收缩行为，窄窗口时不会把页面撑出横向滚动。
+        注意：不要对 QComboBox 局部 setStyleSheet——带样式的盒子模型会把
+        minimumSizeHint 反而撑大（实测 75 -> 91px），这里保持无局部样式。
         """
-        # 覆盖全局 QSS 的 min-width: 100px，让窄窗口下可以折叠
-        combo.setStyleSheet("QComboBox { min-width: 64px; }")
+        combo.setStyleSheet("")
+
+    @staticmethod
+    def _adaptive_combo(combo, min_chars=4, min_width=56):
+        """下拉框按最少字符数收窄，且布局给空间时会自然展开。
+
+        位于拉伸槽位（stretch > 0）的组合框使用，窄窗口不会撑出横向滚动，
+        宽窗口下仍会随行内其他控件一起变宽，不会截断显示。
+        QComboBox 的 minimumSizeHint 不受 AdjustToMinimumContentsLength
+        影响，必须显式 setMinimumWidth 才能真正压低布局最小宽度。
+        """
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(min_chars)
+        combo.setMinimumWidth(min_width)
 
     def _build_control_group(self):
         group = QGroupBox("代理服务")
@@ -200,6 +223,7 @@ class AccelPage(QWidget):
         self.mode_combo.setCurrentIndex(
             max(0, [v for _, v in MODE_LABELS].index(self.config_manager.proxy_mode)))
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+        self.mode_combo.setToolTip("智能分流：国内直连 / 国外走代理；其余模式按名称理解")
         self._shrinkable_combo(self.mode_combo)
         row.addWidget(self.mode_combo)
 
@@ -310,7 +334,7 @@ class AccelPage(QWidget):
         self.sub_name.setPlaceholderText("备注名（可空）")
         self.sub_name.setMaximumWidth(140)
         row.addWidget(self.sub_name, 1)
-        add_btn = QPushButton("添加 / 更新")
+        add_btn = QPushButton("添加/更新")
         add_btn.clicked.connect(self.on_add_subscription)
         row.addWidget(add_btn)
         box.addLayout(row)
@@ -342,11 +366,13 @@ class AccelPage(QWidget):
         box.addWidget(self.node_table)
 
         row3 = QHBoxLayout()
-        test_btn = QPushButton("测速全部")
+        test_btn = QPushButton("测速")
+        test_btn.setToolTip("对全部节点逐个测延迟")
         test_btn.clicked.connect(self.on_test_nodes)
         StyleHelper.set_button_type(test_btn, "default")
         row3.addWidget(test_btn)
-        use_btn = QPushButton("使用选中节点")
+        use_btn = QPushButton("使用节点")
+        use_btn.setToolTip("使用当前选中的节点（也可直接双击该行）")
         use_btn.clicked.connect(self.on_use_node)
         row3.addWidget(use_btn)
         del_btn = QPushButton("删除选中")
@@ -354,11 +380,12 @@ class AccelPage(QWidget):
         StyleHelper.set_button_type(del_btn, "default")
         row3.addWidget(del_btn)
         row3.addStretch()
+        box.addLayout(row3)
+
         self.sub_hint = QLabel("还没有节点，先添加订阅或手动填一条链接")
         self.sub_hint.setStyleSheet("color: #8c8c8c;")
         self.sub_hint.setWordWrap(True)
-        row3.addWidget(self.sub_hint, 1)
-        box.addLayout(row3)
+        box.addWidget(self.sub_hint)
 
         group.setLayout(box)
         return group
@@ -409,11 +436,12 @@ class AccelPage(QWidget):
         StyleHelper.set_button_type(clear_btn, "default")
         row3.addWidget(clear_btn)
         row3.addStretch()
+        box.addLayout(row3)
+
         self.accel_hint = QLabel("")
         self.accel_hint.setStyleSheet("color: #8c8c8c;")
         self.accel_hint.setWordWrap(True)
-        row3.addWidget(self.accel_hint, 1)
-        box.addLayout(row3)
+        box.addWidget(self.accel_hint)
 
         group.setLayout(box)
         return group
@@ -440,10 +468,11 @@ class AccelPage(QWidget):
 
         row = QHBoxLayout()
         self.rule_type = QComboBox()
-        for rtype in RULE_TYPES:
-            self.rule_type.addItem(rtype)
-        self.rule_type.setToolTip("domain-suffix：域名后缀；ip-cidr：IP 段；final：兜底")
-        self._shrinkable_combo(self.rule_type)
+        for label, rtype in RULE_TYPE_LABELS:
+            self.rule_type.addItem(label, rtype)
+        self.rule_type.setToolTip(
+            "域名后缀：匹配 xxx.com 及其子域；IP 段：如 140.82.0.0/16；兜底：其余流量")
+        self._adaptive_combo(self.rule_type)
         row.addWidget(self.rule_type, 1)
         self.rule_value = QLineEdit()
         self.rule_value.setPlaceholderText("匹配值，如 github.com")
@@ -451,7 +480,7 @@ class AccelPage(QWidget):
         self.rule_action = QComboBox()
         for label, value in ACTION_LABELS:
             self.rule_action.addItem(label, value)
-        self._shrinkable_combo(self.rule_action)
+        self._adaptive_combo(self.rule_action)
         row.addWidget(self.rule_action, 1)
         add_btn = QPushButton("添加")
         add_btn.clicked.connect(self.on_add_rule)
@@ -1248,7 +1277,7 @@ class AccelPage(QWidget):
         self.proxy.set_rules(rules)
 
     def on_add_rule(self):
-        rtype = self.rule_type.currentText()
+        rtype = self.rule_type.currentData()
         value = self.rule_value.text().strip()
         action = self.rule_action.currentData()
         if rtype != "final" and not value:

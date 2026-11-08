@@ -145,7 +145,9 @@ class MainWindow(QWidget):
     def setup_ui(self):
         """设置用户界面"""
         self.setWindowTitle(self.app_name)
-        self.setMinimumSize(600, 800)
+        # 最小宽度需容纳网络加速页内容（全局 QSS 下实测约 754px），
+        # 保证 DNS 过滤器与网络加速两页在任何允许尺寸下都不会横向滚动
+        self.setMinimumSize(780, 800)
 
         # 设置无边框窗口
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowSystemMenuHint)

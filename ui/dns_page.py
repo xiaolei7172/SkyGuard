@@ -89,8 +89,11 @@ class DnsPage(QWidget):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-        # --- 顶部状态条 ---
+        # --- 顶部状态条（两行布局，避免一行塞满撑出横向滚动） ---
         top_group = QGroupBox("服务控制")
+        top_box = QVBoxLayout()
+        top_box.setSpacing(8)
+
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
@@ -102,30 +105,37 @@ class DnsPage(QWidget):
         self.listen_label = QLabel(
             f"监听 {'、'.join(self._listen_hosts())} :: 端口 {self.config_manager.dns_port}")
         self.listen_label.setStyleSheet("color: #8c8c8c;")
-        top_row.addWidget(self.listen_label)
-        top_row.addStretch()
+        self.listen_label.setWordWrap(True)
+        top_row.addWidget(self.listen_label, 1)
+
+        top_box.addLayout(top_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
 
         self.restore_btn = QPushButton("恢复系统 DNS")
         self.restore_btn.clicked.connect(self.on_restore_dns)
         StyleHelper.set_button_type(self.restore_btn, "default")
-        top_row.addWidget(self.restore_btn)
+        btn_row.addWidget(self.restore_btn)
 
         self.takeover_btn = QPushButton("接管系统 DNS")
         self.takeover_btn.clicked.connect(self.on_takeover)
         StyleHelper.set_button_type(self.takeover_btn, "default")
-        top_row.addWidget(self.takeover_btn)
+        btn_row.addWidget(self.takeover_btn)
 
         self.start_takeover_btn = QPushButton("启动并接管 DNS")
         self.start_takeover_btn.clicked.connect(self.on_start_and_takeover)
-        top_row.addWidget(self.start_takeover_btn)
+        btn_row.addWidget(self.start_takeover_btn)
 
         self.stop_btn = QPushButton("停止服务")
         self.stop_btn.setToolTip("停止本地 DNS 服务，并自动恢复系统 DNS")
         self.stop_btn.clicked.connect(self.on_stop)
         StyleHelper.set_button_type(self.stop_btn, "danger")
-        top_row.addWidget(self.stop_btn)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addStretch()
 
-        top_group.setLayout(top_row)
+        top_box.addLayout(btn_row)
+        top_group.setLayout(top_box)
         layout.addWidget(top_group)
 
         # --- 统计卡片行 ---
