@@ -31,9 +31,12 @@ from core import dns_lists
 from core.dns_filter import (
     DnsFilter, QTYPE_A, SUPPORTED_PROTOCOLS, Upstream, build_query,
 )
+from core.selfcheck import check_dns
+from ui.selfcheck_dialog import show_results
 from ui.styles import StyleHelper
 from utils import dns_takeover
 from utils.logger import logger
+from utils.privilege import ensure_admin
 
 BLOCKLIST_SUBSCRIBE_URL = "https://anti-ad.net/hosts"
 
@@ -160,6 +163,13 @@ class DnsPage(QWidget):
         self.start_takeover_btn = QPushButton("启动并接管 DNS")
         self.start_takeover_btn.clicked.connect(self.on_start_and_takeover)
         btn_row.addWidget(self.start_takeover_btn)
+
+        self.selfcheck_btn = QPushButton("自检")
+        self.selfcheck_btn.setToolTip("实测 DNS 服务：监听、上游解析、拦截、重写、缓存、日志"
+                                      "（用临时端口，不影响当前服务）")
+        self.selfcheck_btn.clicked.connect(self.on_selfcheck)
+        StyleHelper.set_button_type(self.selfcheck_btn, "default")
+        btn_row.addWidget(self.selfcheck_btn)
 
         self.stop_btn = QPushButton("停止服务")
         self.stop_btn.setToolTip("停止本地 DNS 服务，并自动恢复系统 DNS")
@@ -594,7 +604,39 @@ class DnsPage(QWidget):
         self._update_state()
         return ok, list(self.filter.bind_errors)
 
+    def on_selfcheck(self):
+        """自检 DNS 服务：临时端口起一份实例实测，不影响正在运行的服务与系统设置。"""
+        if getattr(self, "_selfchecking", False):
+            return
+        self._selfchecking = True
+        self.selfcheck_btn.setEnabled(False)
+        self.state_label.setText(self.state_label.text() +
+                                 "<br><span style='color:#8c8c8c;'>正在自检（约 1~3 秒）…</span>")
+
+        def work():
+            try:
+                items = check_dns()
+            except Exception as e:  # 自检本身异常也要回到界面
+                logger.warning(f"DNS 自检异常: {e}")
+                items = []
+                self._ui(lambda: self._after_selfcheck(items, str(e)))
+                return
+            self._ui(lambda: self._after_selfcheck(items, None))
+
+        threading_run(work)
+
+    def _after_selfcheck(self, items, error):
+        self._selfchecking = False
+        self.selfcheck_btn.setEnabled(True)
+        self._update_state()
+        if error:
+            QMessageBox.warning(self, "DNS 自检", f"自检过程出错：\n{error}")
+            return
+        show_results(self, items, "DNS 自检")
+
     def on_start_and_takeover(self):
+        if not ensure_admin(self, "启动并接管系统 DNS"):
+            return
         ok, errors = self._start_service()
         if not ok:
             QMessageBox.critical(self, "DNS 服务", "服务启动失败：\n" + "\n".join(errors))
@@ -602,6 +644,8 @@ class DnsPage(QWidget):
         self.on_takeover(start_if_needed=False)
 
     def on_takeover(self, start_if_needed=True):
+        if not ensure_admin(self, "接管系统 DNS"):
+            return
         if start_if_needed and not self.filter.running:
             ok, errors = self._start_service()
             if not ok:

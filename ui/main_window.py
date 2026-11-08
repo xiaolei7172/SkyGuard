@@ -45,6 +45,8 @@ from utils import (
     get_memory_cleaner,
     get_io_priority_manager,
     IO_PRIORITY_HINT,
+    is_admin,
+    show_admin_help,
 )
 
 from ui.process_io_priority_manager import show_process_io_priority_manager
@@ -135,6 +137,43 @@ class MainWindow(QWidget):
         # 初始应用组件属性
         self.apply_component_properties()
 
+    def _setup_admin_badge(self):
+        """标题栏权限徽标：管理员模式 / 受限模式（点击查看说明，可一键提权）。"""
+        self.admin_badge = QPushButton()
+        self.admin_badge.setObjectName("adminBadge")
+        self.admin_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.admin_badge.setFlat(True)
+        self.admin_badge.clicked.connect(lambda: show_admin_help(self))
+        self.custom_titlebar.add_badge(self.admin_badge)
+        self.refresh_admin_badge()
+
+    def refresh_admin_badge(self):
+        """按当前真实权限刷新徽标文案与配色。"""
+        admin = is_admin()
+        if admin:
+            self.admin_badge.setText("管理员")
+            self.admin_badge.setToolTip("当前以管理员身份运行，全部功能可用")
+            self.admin_badge.setStyleSheet(
+                "QPushButton#adminBadge {"
+                " color: #389e0d; background: rgba(82, 196, 26, 0.14);"
+                " border: none; border-radius: 9px; padding: 2px 9px;"
+                " font-size: 11px; }"
+                "QPushButton#adminBadge:hover { background: rgba(82, 196, 26, 0.24); }")
+        else:
+            self.admin_badge.setText("受限模式 · 点此提权")
+            self.admin_badge.setToolTip(
+                "当前不是管理员：写入 hosts、接管系统 DNS、53 端口 DNS 服务不可用。\n"
+                "点击查看说明并以管理员身份重启。")
+            self.admin_badge.setStyleSheet(
+                "QPushButton#adminBadge {"
+                " color: #d46b08; background: rgba(250, 140, 22, 0.16);"
+                " border: none; border-radius: 9px; padding: 2px 9px;"
+                " font-size: 11px; }"
+                "QPushButton#adminBadge:hover { background: rgba(250, 140, 22, 0.28); }")
+        # 文字变化后让按钮与布局立即按新内容重排，避免只显示前两个字
+        self.admin_badge.adjustSize()
+        self.admin_badge.updateGeometry()
+
     def showEvent(self, event):
         """窗口显示时处理"""
         super().showEvent(event)
@@ -165,6 +204,7 @@ class MainWindow(QWidget):
         # 添加自定义标题栏
         self.custom_titlebar = CustomTitleBar(self)
         main_layout.addWidget(self.custom_titlebar)
+        self._setup_admin_badge()
 
         # 创建内容区域
         content_widget = QWidget()

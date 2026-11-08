@@ -15,7 +15,8 @@ from utils import (
     setup_logger,
     find_icon_path,
     create_notification_thread,
-    run_as_admin,
+    is_admin,
+    prompt_elevate_on_startup,
     check_single_instance,
     get_io_priority_service,
     check_for_update,
@@ -44,9 +45,20 @@ def main(custom_app_info=None, custom_default_config=None, custom_system_config=
     if custom_system_config:
         final_system_config.update(custom_system_config)
 
-    # 检查管理员权限
-    if not run_as_admin():
-        return
+    # 管理员权限：先给出明确提示，由用户选择提权重启或以受限模式运行
+    restricted_mode = False
+    if not is_admin():
+        if "--no-elevate" in sys.argv:
+            restricted_mode = True
+        else:
+            choice = prompt_elevate_on_startup(final_app_info["name"])
+            if choice == "elevated":
+                # 已把控制权交给新的管理员进程
+                return
+            restricted_mode = True
+        print("[SkyGuard] 受限模式：未获得管理员权限。"
+              "写 hosts / 接管系统 DNS / 53 端口 DNS 服务不可用，"
+              "可在标题栏点击「受限模式」重新提权。")
 
     # 检查单实例运行
     mutex_name = f"Global\\{final_app_info['name'].replace(' ', '_')}_MUTEX"

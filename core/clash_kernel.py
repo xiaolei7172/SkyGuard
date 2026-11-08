@@ -14,6 +14,7 @@
 4. 常见 Clash Verge / Clash Nyanpasu / mihomo 安装位置
 5. PATH
 """
+import hashlib
 import json
 import os
 import random
@@ -53,6 +54,63 @@ class KernelNotFound(Exception):
 # ----------------------------------------------------------------------
 def user_kernel_dir():
     return os.path.join(os.path.expanduser("~"), ".skyguard", "core")
+
+
+# GeoIP / GeoSite 数据文件：mihomo 首次启动若找不到会联网下载，被墙时会卡住几十秒
+GEO_SEED_FILES = ("geoip.metadb", "Country.mmdb", "geoip.dat", "geosite.dat")
+
+
+def geo_seed_dirs(kernel_path=""):
+    """可能已有 GeoIP/GeoSite 数据的目录（Clash Verge、mihomo 目录、用户数据目录）。"""
+    dirs = []
+    if kernel_path:
+        base = os.path.dirname(os.path.abspath(kernel_path))
+        dirs.extend([base, os.path.join(base, "resources"), os.path.join(base, "data")])
+    appdata = os.environ.get("APPDATA") or ""
+    localappdata = os.environ.get("LOCALAPPDATA") or ""
+    for root in (appdata, localappdata):
+        if not root:
+            continue
+        for name in ("io.github.clash-verge-rev.clash-verge-rev",
+                     "io.github.clash-verge-rev",
+                     "clash-verge-rev",
+                     "com.core.beyondsky",
+                     "mihomo"):
+            dirs.append(os.path.join(root, name, "clash"))
+            dirs.append(os.path.join(root, name))
+    home = os.path.expanduser("~")
+    dirs.extend([os.path.join(home, ".config", "clash"),
+                 os.path.join(home, ".config", "mihomo"),
+                 os.path.join(home, ".skyguard", "core")])
+    return [d for d in dirs if d and os.path.isdir(d)]
+
+
+def ensure_geo_files(work_dir, kernel_path=""):
+    """把本机已有的 GeoIP/GeoSite 数据复制进内核工作目录。
+
+    内核启动时若缺这些文件会尝试联网下载（GitHub 常被墙），表现为
+    「内核 API 一直不就绪」。复制本机数据可让启动稳定在 1~2 秒。
+    """
+    os.makedirs(work_dir, exist_ok=True)
+    copied = []
+    dirs = geo_seed_dirs(kernel_path)
+    for fname in GEO_SEED_FILES:
+        dest = os.path.join(work_dir, fname)
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            continue
+        for d in dirs:
+            src = os.path.join(d, fname)
+            try:
+                if os.path.isfile(src) and os.path.getsize(src) > 100 * 1024:
+                    shutil.copy2(src, dest)
+                    copied.append(fname)
+                    logger.debug(f"GeoIP 数据已就位：{src} → {dest}")
+                    break
+            except Exception as e:
+                logger.debug(f"复制 GeoIP 数据失败 {src}: {e}")
+    if copied:
+        logger.info(f"GeoIP/GeoSite 数据已准备好：{'、'.join(copied)}")
+    return copied
 
 
 def find_kernel(configured_path=""):
@@ -291,9 +349,41 @@ def build_config(subscriptions, manual_nodes, rules, *, mixed_port=7890,
 
 
 def provider_name(sub_name):
-    """订阅名 → proxy-provider 名（与 build_config 保持一致）。"""
-    return "sub_" + "".join(
-        c if c.isalnum() else "_" for c in (sub_name or "s"))[:24]
+    """订阅名 → proxy-provider 名（与 build_config 保持一致）。
+
+    只能用 ASCII 字母数字：provider 名会出现在内核 API 的 URL 路径里，
+    中文会让 http.client 以 ascii 编码时抛 UnicodeEncodeError。
+    纯中文名退化为短哈希，保证不同订阅不撞名。
+    """
+    raw = str(sub_name or "s")
+    safe = "".join(c if (c.isascii() and c.isalnum()) else "_" for c in raw)[:24]
+    if not safe.strip("_"):
+        safe = hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
+    return "sub_" + safe
+
+
+# 机场常把「剩余流量 / 套餐到期」做成假节点塞进订阅，测速必然失败，需要排除
+INFO_NODE_KEYWORDS = ("剩余流量", "套餐到期", "距离下次", "下次重置", "重置剩余",
+                      "官网", "订阅", "到期时间", "流量重置", "群组", "客服",
+                      "过期时间", "有效期")
+_GROUP_TYPES = {"selector", "urltest", "fallback", "loadbalance", "relay",
+                "direct", "reject", "rejectdrop", "compatible", "pass", "dns", "url-test"}
+_BUILTIN_NODE_NAMES = {"direct", "reject", "reject-drop", "rejectdrop", "compatible",
+                       "pass", "pass-rule", "global", "dns", "dns-out",
+                       "节点选择", "proxy", "自动选择", "global "}
+
+
+def is_real_node(name, meta):
+    """判断内核返回的条目是不是真实可测速的节点（排除分组与信息占位节点）。"""
+    if not isinstance(meta, dict):
+        return False
+    if str(meta.get("type", "")).lower() in _GROUP_TYPES:
+        return False
+    if str(name or "").strip().lower() in _BUILTIN_NODE_NAMES:
+        return False
+    if any(k in str(name or "") for k in INFO_NODE_KEYWORDS):
+        return False
+    return True
 
 
 def node_to_clash(node):
@@ -359,6 +449,8 @@ class MihomoKernel:
             return True
         os.makedirs(self.work_dir, exist_ok=True)
         os.makedirs(os.path.join(self.work_dir, "providers"), exist_ok=True)
+        # 先把本机已有的 GeoIP 数据放到工作目录，避免内核卡在联网下载
+        ensure_geo_files(self.work_dir, self.kernel_path)
         # 以进程对象为准，强制对齐 API 端口与 secret，避免配置侧另生成导致 401
         config_dict["secret"] = self.secret
         config_dict["external-controller"] = f"127.0.0.1:{self.api_port}"
@@ -454,14 +546,68 @@ class MihomoKernel:
             timeout=timeout_ms / 1000 + 3)
         return int(data.get("delay", 0))
 
+    def provider_proxies(self, name):
+        """读取一个订阅源（provider）下的节点，含延迟与存活状态。
+
+        注意：mihomo 把 provider 的节点挂在 /providers/proxies/{name} 里，
+        顶层 /proxies 只有分组和手动节点，所以「读取订阅节点」必须走这里，
+        否则按节点名调 /proxies/{name}/delay 会 404（Resource not found）。
+        """
+        data = self._request("GET", f"/providers/proxies/{_quote(name)}")
+        rows = []
+        for p in data.get("proxies") or []:
+            hist = p.get("history") or []
+            delay = int((hist[-1] or {}).get("delay", 0) or 0) if hist else 0
+            rows.append({
+                "name": p.get("name", ""),
+                "type": str(p.get("type", "")),
+                "alive": bool(p.get("alive", False)),
+                "delay": delay,
+                "provider": p.get("provider-name") or name,
+            })
+        return rows
+
+    def subscription_providers(self):
+        """所有订阅类型（vehicleType=http）的 provider 名。"""
+        try:
+            data = self._request("GET", "/providers/proxies")
+        except OSError as e:
+            logger.debug(f"读取 provider 列表失败: {e}")
+            return []
+        names = []
+        for name, meta in (data.get("providers") or {}).items():
+            if str((meta or {}).get("vehicleType", "")).lower() == "http":
+                names.append(name)
+        return names
+
+    def subscription_nodes(self):
+        """所有订阅里的真实节点（已排除信息占位节点与分组）。"""
+        rows = []
+        for pname in self.subscription_providers():
+            try:
+                items = self.provider_proxies(pname)
+            except OSError as e:
+                logger.debug(f"读取 provider {pname} 节点失败: {e}")
+                continue
+            for node in items:
+                if is_real_node(node["name"], {"type": node["type"]}):
+                    rows.append(node)
+        return rows
+
     def provider_delay(self, provider, timeout_ms=5000):
-        """对整个订阅源做健康检查，返回 {节点名: 延迟ms}。"""
-        data = self._request(
-            "GET",
-            f"/providers/proxies/{_quote(provider)}/healthcheck?timeout={timeout_ms}",
-            timeout=timeout_ms / 1000 + 5)
-        return {k: int(v.get("delay", 0)) for k, v in (data or {}).items()
-                if isinstance(v, dict)}
+        """触发订阅源健康检查，返回 {节点名: 延迟ms}（0 表示不可用）。
+
+        不同 mihomo 版本 healthcheck 的返回体不一致（有的直接空 {}），
+        所以统一以 provider 详情里的 history 为准。
+        """
+        try:
+            self._request(
+                "GET",
+                f"/providers/proxies/{_quote(provider)}/healthcheck?timeout={timeout_ms}",
+                timeout=timeout_ms / 1000 + 8)
+        except OSError as e:
+            logger.debug(f"provider 健康检查接口异常（改用已有历史）：{e}")
+        return {p["name"]: p["delay"] for p in self.provider_proxies(provider)}
 
     def update_provider(self, provider):
         """立即更新一个订阅源（mihomo 会重新拉取该 provider）。"""

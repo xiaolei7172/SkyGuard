@@ -215,7 +215,16 @@ class CustomTitleBar(QWidget):
         # 添加到布局
         self.layout.addWidget(self.icon_label)
         self.layout.addWidget(self.title_label)
+        # 记录徽标插入点：标题右侧、伸缩区之前（供 add_badge 使用）
+        self.badge_index = self.layout.count()
         self.layout.addStretch()
+
+    def add_badge(self, widget):
+        """在标题右侧插入一个状态徽标（位于标题与右侧按钮之间）。"""
+        index = min(getattr(self, "badge_index", 2), self.layout.count())
+        self.layout.insertWidget(index, widget)
+        self.badge_index = index + 1
+        return widget
 
     def _create_buttons(self):
         """创建控制按钮"""

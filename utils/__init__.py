@@ -14,10 +14,18 @@ from utils.version_checker import (
 )
 from utils.system_utils import (
     run_as_admin,
+    is_admin,
+    relaunch_as_admin,
     check_auto_start,
     enable_auto_start,
     disable_auto_start,
     check_single_instance,
+)
+from utils.privilege import (
+    ADMIN_ONLY_FEATURES,
+    ensure_admin,
+    prompt_elevate_on_startup,
+    show_admin_help,
 )
 from utils.memory_cleaner import get_memory_cleaner
 from utils.process_io_priority import get_io_priority_manager, get_io_priority_service, IO_PRIORITY_HINT
@@ -42,6 +50,12 @@ __all__ = [
     "create_update_message",
     "get_version_checker",
     "run_as_admin",
+    "is_admin",
+    "relaunch_as_admin",
+    "ADMIN_ONLY_FEATURES",
+    "ensure_admin",
+    "prompt_elevate_on_startup",
+    "show_admin_help",
     "check_auto_start",
     "enable_auto_start",
     "disable_auto_start",

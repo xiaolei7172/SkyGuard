@@ -13,19 +13,57 @@ from .logger import logger
 from config.app_config import APP_INFO
 
 
-def run_as_admin():
+def is_admin():
     """
-    判断是否以管理员权限运行，如果不是则尝试获取管理员权限
-    
+    仅查询当前进程是否拥有管理员权限，不触发任何提权动作。
+
     Returns:
         bool: 是否以管理员权限运行
     """
-    if not ctypes.windll.shell32.IsUserAnAdmin():
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, " ".join(sys.argv), None, 1
-        )
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception as e:  # 非 Windows 或 API 不可用
+        logger.debug(f"检测管理员权限失败: {e}")
         return False
-    return True
+
+
+def relaunch_as_admin():
+    """
+    以管理员身份重新启动自身（会弹 UAC）。调用方应在成功后退出当前进程。
+
+    Returns:
+        bool: 是否成功发起提权（用户拒绝 UAC 时返回 False）
+    """
+    try:
+        if getattr(sys, "frozen", False):
+            # 打包后 sys.executable 就是程序本体，参数不含脚本路径
+            exe = sys.executable
+            params = subprocess.list2cmdline(sys.argv[1:])
+        else:
+            exe = sys.executable
+            script = os.path.abspath(sys.argv[0])
+            params = subprocess.list2cmdline([script] + sys.argv[1:])
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        ok = int(ret) > 32  # >32 表示成功，<=32 是错误码
+        if not ok:
+            logger.warning(f"请求管理员权限失败，ShellExecuteW 返回 {ret}")
+        return ok
+    except Exception as e:
+        logger.warning(f"以管理员身份重启失败: {e}")
+        return False
+
+
+def run_as_admin():
+    """
+    判断是否以管理员权限运行，如果不是则直接尝试提权重启（旧行为，保留兼容）。
+
+    Returns:
+        bool: 当前进程是否已具备管理员权限
+    """
+    if is_admin():
+        return True
+    relaunch_as_admin()
+    return False
 
 
 def check_single_instance(mutex_name=None):

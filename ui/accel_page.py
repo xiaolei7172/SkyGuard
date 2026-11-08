@@ -39,14 +39,17 @@ from core.local_proxy import (
     MODES, LocalProxy, RuleEngine, format_bytes,
 )
 from core.proxy_connectors import probe_node
+from core.selfcheck import check_proxy_kernel, check_proxy_local, summarize
 from core.proxy_nodes import (
     KNOWN_UNSUPPORTED, NodeStore, ProxyNode, fetch_subscription,
     fetch_subscription_ex, format_traffic,
     parse_proxy_uri, parse_subscription,
 )
 from ui.styles import StyleHelper
+from ui.selfcheck_dialog import show_results
 from utils import system_proxy
 from utils.logger import logger
+from utils.privilege import ensure_admin
 
 
 class TrafficGraph(QWidget):
@@ -322,6 +325,12 @@ class AccelPage(QWidget):
         self.start_btn = QPushButton("启动代理")
         self.start_btn.clicked.connect(self.on_start_proxy)
         row.addWidget(self.start_btn)
+
+        self.selfcheck_btn = QPushButton("自检")
+        self.selfcheck_btn.setToolTip("实测代理链路：订阅拉取 → 节点测速 → 经代理访问外网")
+        self.selfcheck_btn.clicked.connect(self.on_selfcheck)
+        StyleHelper.set_button_type(self.selfcheck_btn, "default")
+        row.addWidget(self.selfcheck_btn)
 
         self.stop_btn = QPushButton("停止代理")
         self.stop_btn.clicked.connect(self.on_stop_proxy)
@@ -891,12 +900,59 @@ class AccelPage(QWidget):
                 logger.debug(f"停止内核失败: {e}")
             self.kernel = None
 
+    def on_selfcheck(self):
+        """自检代理链路：订阅拉取 → 节点测速 → 经代理访问外网（不改系统设置）。"""
+        if getattr(self, "_selfchecking", False):
+            return
+
+        url = ""
+        for sub in self.node_store.subscriptions:
+            if sub.get("enabled", True) and (sub.get("url") or "").strip():
+                url = sub["url"].strip()
+                break
+        if not url:
+            QMessageBox.information(
+                self, "代理自检",
+                "还没有可用的订阅地址。\n\n请在「机场订阅」里添加订阅后再自检。")
+            return
+
+        engine = self._engine()
+        kernel_path = getattr(self.config_manager, "proxy_kernel_path", "") or ""
+        self._selfchecking = True
+        self.selfcheck_btn.setEnabled(False)
+        self.sub_hint.setText("正在自检代理链路…（需要 10~30 秒）")
+
+        def work():
+            if engine == "clash":
+                items = check_proxy_kernel(subscription_url=url, kernel_path=kernel_path)
+                # 内核不可用时退回内置引擎检查，至少确认订阅与网络状态
+                if items and items[0].status == "skip":
+                    items += check_proxy_local(subscription_url=url)
+                return items
+            return check_proxy_local(subscription_url=url)
+
+        def done(items):
+            self._selfchecking = False
+            self.selfcheck_btn.setEnabled(True)
+            stat = summarize(items)
+            self.sub_hint.setText(
+                f"自检完成：通过 {stat['passed']} · 失败 {stat['failed']} "
+                f"· 跳过 {stat['skipped']}")
+            show_results(self, items, "代理自检")
+
+        def failed(err):
+            self._selfchecking = False
+            self.selfcheck_btn.setEnabled(True)
+            self.sub_hint.setText(f"自检失败：{err}")
+            QMessageBox.warning(self, "代理自检", f"自检过程出错：\n{err}")
+
+        self._run(work, done, failed)
+
     def on_start_proxy(self):
         port = self.listen_port.value()
         host = self.listen_host.currentText()
         mode = self.mode_combo.currentData()
         self.config_manager.set_proxy_config(enabled=True, host=host, port=port, mode=mode)
-
         if self._engine() == "clash":
             self.proxy.stop()          # 内核模式下内置引擎保持停止
             self.proxy.port = port     # 供系统代理判断使用
@@ -1146,41 +1202,49 @@ class AccelPage(QWidget):
         self.refresh_status()
 
     def _refresh_node_table_kernel(self, latencies):
-        """内核模式：节点列表来自 mihomo（订阅里的 hysteria2/vless 等全部在内）。"""
-        skip = {"DIRECT", "REJECT", "REJECT-DROP", "COMPATIBLE", "PASS",
-                "GLOBAL", "GLOBAL ", "PROXY", "节点选择"}
+        """内核模式：节点来自 mihomo（hysteria2 / vless 等全部支持）。
+
+        订阅节点挂在 /providers/proxies/{name} 下，顶层 /proxies 只有分组，
+        所以订阅节点必须用 subscription_nodes() 取，再补上手动节点。
+        """
+        latencies = latencies or {}
         rows = []
         if self.kernel is not None and self.kernel.running:
+            try:
+                for item in self.kernel.subscription_nodes():
+                    rows.append((item["name"], item["type"],
+                                 latencies.get(item["name"]) or item.get("delay", 0),
+                                 item.get("provider") or "订阅"))
+            except OSError as e:
+                logger.debug(f"读取订阅节点失败: {e}")
             try:
                 info = self.kernel.proxies()
             except OSError as e:
                 logger.debug(f"读取内核节点失败: {e}")
                 info = {}
             for name, meta in info.items():
-                if name in skip or "all" in meta:
+                if not clash_kernel.is_real_node(name, meta):
                     continue
-                if str(meta.get("type", "")).lower() in ("direct", "reject",
-                                                        "compatible", "pass"):
-                    continue
-                rows.append((name, meta))
+                hist = meta.get("history") or []
+                rows.append((name, str(meta.get("type", "")),
+                             latencies.get(name) or (int(hist[-1].get("delay", 0))
+                                                     if hist else 0),
+                             "手动"))
+
         keyword = self.node_search.text().strip().lower()
         if keyword:
-            rows = [(n, m) for n, m in rows if keyword in n.lower()]
-        decorated = []
-        for name, meta in rows:
-            hist = meta.get("history") or []
-            ms = latencies.get(name) or (hist[-1].get("delay") if hist else 0)
-            decorated.append((name, meta, ms))
+            rows = [r for r in rows if keyword in r[0].lower()]
         if self.sort_btn.isChecked():
-            decorated.sort(key=lambda item: (item[2] or 99999, item[0]))
-        self.node_table.setRowCount(len(decorated))
-        for r, (name, meta, ms) in enumerate(decorated):
+            rows.sort(key=lambda item: (item[2] or 99999, item[0]))
+        self._kernel_rows = rows
+        self.node_table.setRowCount(len(rows))
+        for r, (name, ntype, ms, source) in enumerate(rows):
             values = [
                 ("★ " if name == self.selected_kernel_node else "") + name,
-                str(meta.get("type", "")).upper(),
+                str(ntype).upper(),
                 "—",
                 f"{ms} ms" if ms else "—",
-                "内核",
+                source,
             ]
             for c, text in enumerate(values):
                 cell = QTableWidgetItem(str(text))
@@ -1190,8 +1254,9 @@ class AccelPage(QWidget):
                     cell.setForeground(_delay_color(ms))
                 self.node_table.setItem(r, c, cell)
         if rows:
+            subs = len(self.kernel.subscription_providers()) if self.kernel else 0
             self.sub_hint.setText(f"mihomo 内核 · {len(rows)} 个节点"
-                                  "（订阅由内核自动拉取与更新）")
+                                  + (f"（{subs} 个订阅由内核自动拉取）" if subs else ""))
         elif self.kernel is not None and self.kernel.running:
             self.sub_hint.setText("内核已启动但还没有节点，请先添加订阅后重启代理")
         else:
@@ -1434,24 +1499,21 @@ class AccelPage(QWidget):
         kernel = self.kernel
 
         def work():
+            # 订阅节点只能通过 provider 健康检查拿延迟（逐节点 /proxies/{name}/delay 会 404）
+            latencies = {}
+            for pname in kernel.subscription_providers():
+                latencies.update(kernel.provider_delay(pname, timeout_ms=5000))
             try:
                 info = kernel.proxies()
-            except OSError as e:
-                raise RuntimeError(f"读取内核节点失败: {e}")
-            skip = {"DIRECT", "REJECT", "REJECT-DROP", "COMPATIBLE", "PASS",
-                    "GLOBAL", "PROXY"}
-            names = [n for n, m in info.items()
-                     if n not in skip and "all" not in m]
-
-            def probe(name):
-                try:
-                    return name, kernel.test_delay(name, timeout_ms=5000)
-                except OSError:
-                    return name, 0
-
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                results = list(pool.map(probe, names))
-            return {n: ms for n, ms in results if ms}
+            except OSError:
+                info = {}
+            for name, meta in info.items():
+                if clash_kernel.is_real_node(name, meta):
+                    try:
+                        latencies[name] = kernel.test_delay(name, timeout_ms=5000)
+                    except OSError:
+                        pass
+            return {n: ms for n, ms in latencies.items() if ms}
 
         def done(latencies):
             self._testing_nodes = False
@@ -1595,6 +1657,8 @@ class AccelPage(QWidget):
             self.accel_hint.setText(f"已缓存 {len(pairs)} 个域名的优选 IP")
 
     def on_write_hosts(self):
+        if not ensure_admin(self, "写入 hosts 加速"):
+            return
         ok, msg, count = ip_optimizer.write_hosts(self.ip_cache.as_hosts_pairs())
         (QMessageBox.information if ok else QMessageBox.warning)(self, "写入 hosts", msg)
         self.accel_hint.setText(msg.splitlines()[0])
