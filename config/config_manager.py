@@ -74,6 +74,9 @@ class ConfigManager:
         self.floating_pos_y = floating["y"]
         self.floating_items = dict(floating["items"])
 
+        # DNS 过滤器设置
+        self._load_dns_config(self.default_config["dns_filter"])
+
         # 确保配置目录存在
         self._ensure_directories()
 
@@ -239,6 +242,10 @@ class ConfigManager:
                 if isinstance(config_data.get("floating_window"), dict):
                     self._load_floating_config(config_data["floating_window"])
 
+                # 读取 DNS 过滤器设置
+                if isinstance(config_data.get("dns_filter"), dict):
+                    self._load_dns_config(config_data["dns_filter"])
+
                 logger.debug("配置文件加载成功")
                 return True
             except Exception as e:
@@ -284,6 +291,9 @@ class ConfigManager:
             # 加载悬浮窗默认设置
             self._load_floating_config(self.default_config["floating_window"])
 
+            # 加载 DNS 过滤器默认设置
+            self._load_dns_config(self.default_config["dns_filter"])
+
             logger.debug("已创建并加载默认配置")
         except Exception as e:
             logger.error(f"创建默认配置文件失败: {str(e)}")
@@ -328,6 +338,14 @@ class ConfigManager:
                     "x": self.floating_pos_x,
                     "y": self.floating_pos_y,
                     "items": self.floating_items,
+                },
+                "dns_filter": {
+                    "enabled": self.dns_enabled,
+                    "port": self.dns_port,
+                    "listen_lan": self.dns_listen_lan,
+                    "block_action": self.dns_block_action,
+                    "selected_upstream": self.dns_selected_upstream,
+                    "upstreams": self.dns_upstreams,
                 },
             }
 
@@ -385,6 +403,61 @@ class ConfigManager:
         self.floating_items = merged
 
         logger.debug(f"已从配置文件加载悬浮窗设置: 启用={self.floating_enabled}")
+
+    def _load_dns_config(self, cfg):
+        """从配置字典读取 DNS 过滤器设置，非法值回落默认。"""
+        default = self.default_config["dns_filter"]
+        self.dns_enabled = bool(cfg.get("enabled", default["enabled"]))
+        try:
+            self.dns_port = min(65535, max(1, int(cfg.get("port", default["port"]))))
+        except (TypeError, ValueError):
+            self.dns_port = default["port"]
+        self.dns_listen_lan = bool(cfg.get("listen_lan", default["listen_lan"]))
+        action = cfg.get("block_action", default["block_action"])
+        self.dns_block_action = action if action in ("blackhole", "nxdomain") else default["block_action"]
+        try:
+            self.dns_selected_upstream = max(0, int(cfg.get("selected_upstream", default["selected_upstream"])))
+        except (TypeError, ValueError):
+            self.dns_selected_upstream = 0
+        upstreams = cfg.get("upstreams")
+        if isinstance(upstreams, list) and upstreams:
+            cleaned = []
+            for u in upstreams:
+                if not isinstance(u, dict):
+                    continue
+                addr = str(u.get("address", "")).strip()
+                proto = str(u.get("proto", "UDP")).strip().upper()
+                if not addr or proto not in ("UDP", "DOH", "DOT"):
+                    continue
+                cleaned.append({"name": str(u.get("name", "")).strip() or f"{proto}-{addr}",
+                                "proto": {"DOH": "DoH", "DOT": "DoT"}.get(proto, "UDP"),
+                                "address": addr})
+            self.dns_upstreams = cleaned or [dict(x) for x in default["upstreams"]]
+        else:
+            self.dns_upstreams = [dict(x) for x in default["upstreams"]]
+        logger.debug(f"已从配置文件加载 DNS 过滤器设置: 端口={self.dns_port} 上游={len(self.dns_upstreams)}")
+
+    def _save_dns(self):
+        """DNS 过滤器设置变更后落盘。"""
+        if not self.save_config():
+            logger.warning("DNS 过滤器设置保存失败，本次修改仅在当前会话生效")
+
+    def set_dns_config(self, **kwargs):
+        """批量更新 DNS 过滤器配置项并保存。"""
+        mapping = {
+            "enabled": "dns_enabled",
+            "port": "dns_port",
+            "listen_lan": "dns_listen_lan",
+            "block_action": "dns_block_action",
+            "selected_upstream": "dns_selected_upstream",
+            "upstreams": "dns_upstreams",
+        }
+        for key, value in kwargs.items():
+            attr = mapping.get(key)
+            if attr:
+                setattr(self, attr, value)
+        self._save_dns()
+
 
     def _save_floating(self):
         """悬浮窗设置变更后落盘。写失败只记日志，不影响界面继续用。"""

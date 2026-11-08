@@ -63,6 +63,19 @@ DEFAULT_CONFIG = {
             "memory": True,
             "temp": True
         }
+    },
+    "dns_filter": {
+        "enabled": False,                     # DNS 过滤服务默认不随程序启动
+        "port": 53,
+        "listen_lan": False,                  # True 时同时监听 0.0.0.0（局域网设备可访问）
+        "block_action": "blackhole",          # blackhole=返回0.0.0.0 / nxdomain=返回不存在
+        "selected_upstream": 0,
+        "upstreams": [
+            {"name": "阿里 UDP", "proto": "UDP", "address": "223.5.5.5:53"},
+            {"name": "阿里 DoT", "proto": "DoT", "address": "223.5.5.5:853"},
+            {"name": "阿里 DoH", "proto": "DoH", "address": "https://dns.alidns.com/dns-query"},
+            {"name": "腾讯 DoH", "proto": "DoH", "address": "https://doh.pub/dns-query"}
+        ]
     }
 }
 
