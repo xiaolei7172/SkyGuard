@@ -214,11 +214,11 @@ class ThemeManager(QObject):
             background-color: {colors.PRIMARY_6};
             color: {"#ffffff" if colors == AntColors else colors.GRAY_13};
             border: 1px solid {colors.PRIMARY_6};
-            border-radius: 4px;
-            padding: 4px 10px;
+            border-radius: 6px;
+            padding: 5px 14px;
             font-weight: 500;
-            font-size: 12px;
-            min-height: 25px;
+            font-size: 13px;
+            min-height: 28px;
             outline: none;
         }}
         
@@ -243,35 +243,36 @@ class ThemeManager(QObject):
             border-width: 2px;
         }}
         
-        /* 按钮变体 */
+        /* 按钮变体：success / warning 用浅底描边的 ghost 风格，
+           避免一排饱和色块；danger 保留实色，用于高危操作 */
         QPushButton[buttonType="success"] {{
-            background-color: {colors.SUCCESS_6};
-            border-color: {colors.SUCCESS_6};
-            color: {"#ffffff" if colors == AntColors else colors.GRAY_13};
+            background-color: {colors.SUCCESS_1};
+            border-color: {colors.SUCCESS_3};
+            color: {colors.SUCCESS_7};
         }}
-        
+
         QPushButton[buttonType="success"]:hover {{
-            background-color: {colors.SUCCESS_5};
-            border-color: {colors.SUCCESS_5};
+            background-color: {colors.SUCCESS_2};
+            border-color: {colors.SUCCESS_4};
         }}
-        
+
         QPushButton[buttonType="warning"] {{
-            background-color: {colors.WARNING_6};
-            border-color: {colors.WARNING_6};
-            color: {"#ffffff" if colors == AntColors else colors.GRAY_13};
+            background-color: {colors.WARNING_1};
+            border-color: {colors.WARNING_3};
+            color: {colors.WARNING_9};
         }}
-        
+
         QPushButton[buttonType="warning"]:hover {{
-            background-color: {colors.WARNING_5};
-            border-color: {colors.WARNING_5};
+            background-color: {colors.WARNING_2};
+            border-color: {colors.WARNING_4};
         }}
-        
+
         QPushButton[buttonType="danger"] {{
             background-color: {colors.ERROR_6};
             border-color: {colors.ERROR_6};
             color: {"#ffffff" if colors == AntColors else colors.GRAY_13};
         }}
-        
+
         QPushButton[buttonType="danger"]:hover {{
             background-color: {colors.ERROR_5};
             border-color: {colors.ERROR_5};
@@ -403,10 +404,10 @@ class ThemeManager(QObject):
         }}
         
         QCheckBox::indicator {{
-            width: 14px;
-            height: 14px;
-            border-radius: 2px;
-            border: 1px solid {colors.GRAY_5};
+            width: 16px;
+            height: 16px;
+            border-radius: 4px;
+            border: 1px solid {colors.GRAY_6};
             background-color: {colors.GRAY_1};
         }}
         
@@ -522,147 +523,55 @@ class ThemeManager(QObject):
             color: {colors.GRAY_9};
             background-color: {colors.GRAY_1};
             border: 1px solid {colors.GRAY_4};
-            border-radius: 6px;
-            margin-top: 8px;
-            padding-top: 8px;
+            border-radius: 8px;
+            margin-top: 16px;
+            padding: 12px 14px 10px 14px;
         }}
-        
+
         QGroupBox::title {{
             subcontrol-origin: margin;
-            subcontrol-position: top center;
-            padding: 0px 5px;
-            background-color: {colors.GRAY_1};
-            color: {colors.GRAY_9};
+            subcontrol-position: top left;
+            left: 12px;
+            top: 4px;
+            padding: 0px 4px;
+            background-color: transparent;
+            color: {colors.PRIMARY_7};
         }}
         
-        /* === 选项卡样式 === */
-        /* 选项卡容器面板 - 关键的圆角处理 */
+        /* === 选项卡样式（现代下划线风格） === */
         QTabWidget::pane {{
             border: 1px solid {colors.GRAY_4};
+            border-radius: 8px;
             background-color: {colors.GRAY_1};
-            /* 面板的圆角处理：左上角需要根据选中的标签位置动态处理 */
-            border-top-left-radius: 0px;   /* 如果第一个标签被选中，这里需要是0 */
-            border-top-right-radius: 6px;  /* 右上角始终有圆角 */
-            border-bottom-left-radius: 6px; /* 左下角圆角 */
-            border-bottom-right-radius: 6px; /* 右下角圆角 */
-            margin-top: -1px; /* 与选中标签无缝连接 */
-            padding: 8px;
+            padding: 10px;
         }}
-        
-        /* 选项卡标签样式 */
+
+        /* 选项卡标签：无边框透明底，选中项用主色下划线指示 */
         QTabBar::tab {{
-            background-color: {colors.GRAY_2};
+            background-color: transparent;
             color: {colors.GRAY_8};
-            padding: 8px 16px;
-            margin-right: 0px; /* 去掉标签间距 */
-            margin-bottom: 0px;
-            border: 1px solid {colors.GRAY_4};
-            border-bottom: none; /* 底部无边框，与面板融合 */
-            font-size: 12px;
+            padding: 8px 18px;
+            margin-right: 4px;
+            border: none;
+            border-bottom: 2px solid transparent;
+            font-size: 13px;
             font-weight: 500;
-            min-width: 80px;
-            min-height: 20px;
-            /* 默认不显示圆角 */
-            border-top-left-radius: 0px;
-            border-top-right-radius: 0px;
-            border-bottom-left-radius: 0px;
-            border-bottom-right-radius: 0px;
+            min-width: 72px;
+            min-height: 22px;
         }}
-        
-        /* 选中的标签 */
+
         QTabBar::tab:selected {{
-            background-color: {colors.GRAY_1}; /* 与面板颜色一致 */
             color: {colors.PRIMARY_6};
-            border-color: {colors.GRAY_4};
-            border-bottom-color: {colors.GRAY_1}; /* 底部边框与面板颜色一致，实现无缝连接 */
-            margin-bottom: -1px; /* 向下延伸1px，确保完全覆盖面板边框 */
+            border-bottom: 2px solid {colors.PRIMARY_6};
+            font-weight: 600;
         }}
-        
-        /* 第一个标签被选中时的特殊处理 */
-        QTabBar::tab:selected:first {{
-            border-top-left-radius: 6px; /* 左上角圆角 */
-            border-left: 1px solid {colors.GRAY_4}; /* 恢复左边框 */
-        }}
-        
-        /* 最后一个标签被选中时的特殊处理 */
-        QTabBar::tab:selected:last {{
-            border-top-right-radius: 6px; /* 右上角圆角 */
-            border-right: 1px solid {colors.GRAY_4}; /* 恢复右边框 */
-        }}
-        
-        /* 未选中标签的悬停效果 */
+
         QTabBar::tab:hover:!selected {{
-            background-color: {colors.GRAY_3};
-            color: {colors.GRAY_9};
-            border-color: {colors.PRIMARY_4};
+            color: {colors.PRIMARY_5};
         }}
-        
-        /* 第一个标签悬停时的特殊处理 */
-        QTabBar::tab:hover:!selected:first {{
-            border-left: 1px solid {colors.PRIMARY_4}; /* 恢复左边框 */
-        }}
-        
-        /* 最后一个标签悬停时的特殊处理 */
-        QTabBar::tab:hover:!selected:last {{
-            border-right: 1px solid {colors.PRIMARY_4}; /* 恢复右边框 */
-        }}
-        
-        /* 第一个标签的特殊样式 */
-        QTabBar::tab:first {{
-            margin-left: 0px; /* 第一个标签左边距为0 */
-            border-top-left-radius: 6px; /* 只有左上角圆角 */
-            border-left: 1px solid {colors.GRAY_4}; /* 恢复左边框 */
-        }}
-        
-        /* 最后一个标签的特殊样式 */
-        QTabBar::tab:last {{
-            margin-right: 0px; /* 最后一个标签右边距为0 */
-            border-top-right-radius: 6px; /* 只有右上角圆角 */
-            border-right: 1px solid {colors.GRAY_4}; /* 恢复右边框 */
-        }}
-        
-        /* 只有一个标签时的特殊处理 */
-        QTabBar::tab:only-one {{
-            border-top-left-radius: 6px; /* 左上角圆角 */
-            border-top-right-radius: 6px; /* 右上角圆角 */
-            border-left: 1px solid {colors.GRAY_4}; /* 左边框 */
-            border-right: 1px solid {colors.GRAY_4}; /* 右边框 */
-        }}
-        
-        /* 选项卡在不同位置时的圆角处理 */
-        QTabWidget[tabPosition="North"] QTabWidget::pane {{
-            border-top-left-radius: 0px;
-            border-top-right-radius: 6px;
-            border-bottom-left-radius: 6px;
-            border-bottom-right-radius: 6px;
-        }}
-        
-        QTabWidget[tabPosition="South"] QTabWidget::pane {{
-            border-top-left-radius: 6px;
-            border-top-right-radius: 6px;
-            border-bottom-left-radius: 0px;
-            border-bottom-right-radius: 6px;
-        }}
-        
-        QTabWidget[tabPosition="West"] QTabWidget::pane {{
-            border-top-left-radius: 0px;
-            border-top-right-radius: 6px;
-            border-bottom-left-radius: 0px;
-            border-bottom-right-radius: 6px;
-        }}
-        
-        QTabWidget[tabPosition="East"] QTabWidget::pane {{
-            border-top-left-radius: 6px;
-            border-top-right-radius: 0px;
-            border-bottom-left-radius: 6px;
-            border-bottom-right-radius: 0px;
-        }}
-        
-        /* 禁用状态的标签 */
+
         QTabBar::tab:disabled {{
-            background-color: {colors.GRAY_3};
             color: {colors.GRAY_6};
-            border-color: {colors.GRAY_4};
         }}
         
         /* 选项卡栏本身的样式 */

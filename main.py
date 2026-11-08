@@ -14,7 +14,6 @@ from utils import (
     logger,
     setup_logger,
     find_icon_path,
-    send_notification,
     create_notification_thread,
     run_as_admin,
     check_single_instance,
@@ -89,28 +88,9 @@ def main(custom_app_info=None, custom_default_config=None, custom_system_config=
     # 创建并运行PySide6图形界面
     app, window = create_gui(config_manager, monitor, icon_path, start_minimized)
 
-    app_name = config_manager.get_app_name()
-    app_author = config_manager.get_app_author()
-    github_repo = config_manager.get_github_repo()
-    github_releases = config_manager.get_github_releases_url()
-
     if config_manager.check_update_on_start:
         logger.debug("启动时检查更新已开启，执行静默检查更新...")
         check_for_update(config_manager, silent_mode=True)
-
-    buttons = [
-        {"text": "访问项目官网", "action": "open_url", "launch": f"https://github.com/{github_repo}"},
-        {"text": "下载最新版本", "action": "open_url", "launch": github_releases},
-    ]
-
-    # 不受Windows通知选项限制，每次开启都显示通知
-    send_notification(
-        title=app_name,
-        message=f"🚀 欢迎使用 {app_name} ！\n🐶 作者: {app_author}",
-        icon_path=icon_path,
-        buttons=buttons,
-        silent=True,  # 通知是否静音
-    )
 
     try:
         # 运行应用（这会阻塞主线程直到应用程序退出）

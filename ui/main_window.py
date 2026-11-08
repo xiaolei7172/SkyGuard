@@ -472,9 +472,18 @@ class MainWindow(QWidget):
         # 填充剩余空间
         memory_layout.addStretch()
 
-        # 设置选项卡
+        # 设置选项卡（内容较高，包一层滚动区，窗口不够高时可滚动）
         settings_tab = QWidget()
-        settings_layout = QVBoxLayout(settings_tab)
+        settings_outer = QVBoxLayout(settings_tab)
+        settings_outer.setContentsMargins(0, 0, 0, 0)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        settings_inner = QWidget()
+        settings_layout = QVBoxLayout(settings_inner)
+        settings_scroll.setWidget(settings_inner)
+        settings_outer.addWidget(settings_scroll)
 
         # 通知设置
         notify_group = QGroupBox("通知设置")
@@ -1733,41 +1742,25 @@ class MainWindow(QWidget):
 
     def show_about(self):
         """显示关于对话框"""
-        # 创建自定义消息框，添加访问官网的选项
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("关于")
         msg_box.setText(
-            f"{self.app_name}\n\n"
-            f"作者: {self.app_author}\n\n"
-            f"描述: {self.app_description}\n\n"
-            "💡 如果这个工具对您有帮助，欢迎访问GitHub项目页面：\n"
-            "   • 点击⭐Star支持项目发展\n"
-            "   • 提交Issues反馈问题和建议\n"
-            "   • 分享给更多需要的朋友\n\n"
-            "您的支持是项目持续改进的动力！\n\n"
-            "是否访问项目官网？"
+            f"{self.app_name} v{self.config_manager.get_app_version()}\n\n"
+            f"{self.app_description}\n\n"
+            "基于 Cassianvale/ACE-KILLER（GPL-3.0）二次开发，"
+            "感谢原作者的贡献。"
         )
-
         msg_box.setIcon(QMessageBox.Icon.NoIcon)
 
-        # 添加自定义按钮
-        visit_btn = msg_box.addButton("⭐ 访问GitHub主页", QMessageBox.ButtonRole.ActionRole)
-        close_btn = msg_box.addButton("❌ 关闭", QMessageBox.ButtonRole.RejectRole)
+        repo_btn = msg_box.addButton("打开项目仓库", QMessageBox.ButtonRole.ActionRole)
+        msg_box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+        msg_box.setDefaultButton(msg_box.buttons()[-1])
 
-        # 设置默认按钮
-        msg_box.setDefaultButton(visit_btn)
-
-        # 执行对话框并处理结果
         msg_box.exec()
-        clicked_button = msg_box.clickedButton()
-
-        # 如果点击了访问官网按钮
-        if clicked_button == visit_btn:
+        if msg_box.clickedButton() == repo_btn:
             import webbrowser
 
-            github_url = f"https://github.com/{self.github_repo}"
-            webbrowser.open(github_url)
-            logger.debug("用户通过关于对话框访问了项目官网")
+            webbrowser.open(f"https://github.com/{self.github_repo}")
 
     def toggle_main_window(self):
         """切换主窗口的显示状态"""

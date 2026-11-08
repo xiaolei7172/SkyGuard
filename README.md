@@ -2,23 +2,14 @@
 
 # 🛡️ SkyGuard · 天幕进程优化工具
 
-<img src="https://socialify.git.ci/xiaolei7172/SkyGuard/image?font=Jost&forks=1&issues=1&name=1&pattern=Plus&stargazers=1&theme=Dark" alt="SkyGuard" width="640" height="320" />
+游戏反作弊进程管理工具，专为无畏契约、三角洲行动等使用 ACE 反作弊的游戏设计。
 
-✨ _游戏反作弊进程管理工具，专为无畏契约、三角洲行动等使用 ACE 反作弊的游戏设计_ ✨
-
-<!-- 项目状态徽章 -->
 <div>
     <img alt="platform" src="https://img.shields.io/badge/Platform-Windows-blue?style=flat-square&logo=windows">
     <img alt="python" src="https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python&logoColor=white">
     <img alt="license" src="https://img.shields.io/badge/License-GPL--3.0-green?style=flat-square&logo=gnu">
     <img alt="version" src="https://img.shields.io/github/v/release/xiaolei7172/SkyGuard?style=flat-square&color=orange&logo=github">
 </div>
-
-<div>
-    <img alt="total downloads" src="https://img.shields.io/github/downloads/xiaolei7172/SkyGuard/total?style=for-the-badge&label=%E6%80%BB%E4%B8%8B%E8%BD%BD%E6%AC%A1%E6%95%B0&color=success">
-    <img alt="latest release downloads" src="https://img.shields.io/github/downloads/xiaolei7172/SkyGuard/latest/total?style=for-the-badge&label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC%E4%B8%8B%E8%BD%BD&color=blue">
-</div>
-<br/>
 
 
 <div align="left">
