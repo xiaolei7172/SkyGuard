@@ -157,6 +157,14 @@ class AccelPage(QWidget):
         self.refresh_status()
 
     # -- 服务控制 ----------------------------------------------------
+    def _shrinkable_combo(self, combo):
+        """下拉框允许收窄：只把最小宽度降到 64px，宽窗口下仍按内容自然展开。
+
+        DNS 页与代理页保持一致的收缩行为，窄窗口时不会把页面撑出横向滚动。
+        """
+        # 覆盖全局 QSS 的 min-width: 100px，让窄窗口下可以折叠
+        combo.setStyleSheet("QComboBox { min-width: 64px; }")
+
     def _build_control_group(self):
         group = QGroupBox("代理服务")
         box = QVBoxLayout()
@@ -172,6 +180,7 @@ class AccelPage(QWidget):
         self.listen_host.addItems(["127.0.0.1", "0.0.0.0"])
         self.listen_host.setCurrentText(self.config_manager.proxy_host)
         self.listen_host.setToolTip("0.0.0.0 表示允许局域网其他设备使用本机代理")
+        self._shrinkable_combo(self.listen_host)
         row.addWidget(self.listen_host)
 
         self.listen_port = QSpinBox()
@@ -185,6 +194,7 @@ class AccelPage(QWidget):
         self.mode_combo.setCurrentIndex(
             max(0, [v for _, v in MODE_LABELS].index(self.config_manager.proxy_mode)))
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+        self._shrinkable_combo(self.mode_combo)
         row.addWidget(self.mode_combo)
 
         row.addStretch()
@@ -214,8 +224,12 @@ class AccelPage(QWidget):
 
         self.status_detail = QLabel("")
         self.status_detail.setStyleSheet("color: #8c8c8c;")
-        row2.addWidget(self.status_detail)
-        box.addLayout(row2)
+        # 允许换行并放开最小宽度限制，窄窗口时折叠而不是把整页撑出横向滚动
+        self.status_detail.setWordWrap(True)
+        self.status_detail.setMinimumWidth(0)
+        self.status_detail.setSizePolicy(self.status_detail.sizePolicy().horizontalPolicy(),
+                                         self.status_detail.sizePolicy().verticalPolicy())
+        row2.addWidget(self.status_detail, 1)
 
         group.setLayout(box)
         return group
@@ -313,7 +327,8 @@ class AccelPage(QWidget):
         row3.addStretch()
         self.sub_hint = QLabel("还没有节点，先添加订阅或手动填一条链接")
         self.sub_hint.setStyleSheet("color: #8c8c8c;")
-        row3.addWidget(self.sub_hint)
+        self.sub_hint.setWordWrap(True)
+        row3.addWidget(self.sub_hint, 1)
         box.addLayout(row3)
 
         group.setLayout(box)
@@ -367,7 +382,8 @@ class AccelPage(QWidget):
         row3.addStretch()
         self.accel_hint = QLabel("")
         self.accel_hint.setStyleSheet("color: #8c8c8c;")
-        row3.addWidget(self.accel_hint)
+        self.accel_hint.setWordWrap(True)
+        row3.addWidget(self.accel_hint, 1)
         box.addLayout(row3)
 
         group.setLayout(box)
@@ -398,6 +414,7 @@ class AccelPage(QWidget):
         for rtype in RULE_TYPES:
             self.rule_type.addItem(rtype)
         self.rule_type.setToolTip("domain-suffix：域名后缀；ip-cidr：IP 段；final：兜底")
+        self._shrinkable_combo(self.rule_type)
         row.addWidget(self.rule_type, 1)
         self.rule_value = QLineEdit()
         self.rule_value.setPlaceholderText("匹配值，如 github.com")
@@ -405,6 +422,7 @@ class AccelPage(QWidget):
         self.rule_action = QComboBox()
         for label, value in ACTION_LABELS:
             self.rule_action.addItem(label, value)
+        self._shrinkable_combo(self.rule_action)
         row.addWidget(self.rule_action, 1)
         add_btn = QPushButton("添加")
         add_btn.clicked.connect(self.on_add_rule)
