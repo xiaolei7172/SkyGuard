@@ -42,17 +42,18 @@ from core.local_proxy import (
     MODES, LocalProxy, RuleEngine, format_bytes,
 )
 from core.proxy_connectors import probe_node
-from core.selfcheck import check_proxy_kernel, check_proxy_local, summarize
 from core.proxy_nodes import (
     KNOWN_UNSUPPORTED, NodeStore, ProxyNode, fetch_subscription,
     fetch_subscription_ex, format_traffic,
     parse_proxy_uri, parse_subscription,
 )
 from ui.styles import StyleHelper
-from ui.selfcheck_dialog import show_results
 from utils import system_proxy
 from utils.logger import logger
 from utils.privilege import ensure_admin
+
+# core.selfcheck / ui.selfcheck_dialog 只在点"自检"时用，且各自带着
+# local_proxy、requests 等重依赖，放进函数内导入可少 40ms 启动时间
 
 
 class TrafficGraph(QWidget):
@@ -192,7 +193,9 @@ class AccelPage(QWidget):
         )
         self.proxy.stats.reset()
 
-        self.ui_call.connect(lambda f: f())
+        # 回调统一走带兜底的分发器：界面回调里抛异常时只记日志，
+        # 不会把状态机卡在"进行中"（Qt 默认只往 stderr 打一行，用户看不到）
+        self.ui_call.connect(self._dispatch_ui)
         self.setup_ui()
 
         self.stats_timer = QTimer(self)
@@ -214,6 +217,13 @@ class AccelPage(QWidget):
     def _ui(self, func):
         self.ui_call.emit(func)
 
+    def _dispatch_ui(self, func):
+        """主线程执行回调；回调本身出错只记日志，避免界面状态机卡死。"""
+        try:
+            func()
+        except Exception as e:
+            logger.error(f"加速页界面回调失败: {e}")
+
     def _run(self, func, on_done=None, on_error=None):
         """后台执行，结果回主线程。"""
         def worker():
@@ -222,7 +232,10 @@ class AccelPage(QWidget):
             except Exception as e:  # 网络异常不弹堆栈，交给界面提示
                 logger.warning(f"加速页后台任务失败: {e}")
                 if on_error:
-                    self._ui(lambda: on_error(e))
+                    # 必须先把异常绑到局部名：except 块结束时 Python 会删掉 e，
+                    # lambda 延迟到主线程执行时再引用会 NameError，错误提示永远出不来
+                    err = e
+                    self._ui(lambda: on_error(err))
                 return
             if on_done:
                 self._ui(lambda: on_done(result))
@@ -1232,6 +1245,10 @@ class AccelPage(QWidget):
         """自检代理链路：订阅拉取 → 节点测速 → 经代理访问外网（不改系统设置）。"""
         if getattr(self, "_selfchecking", False):
             return
+
+        # 懒导入：自检模块带着 requests 等重依赖，启动时不需要
+        from core.selfcheck import check_proxy_kernel, check_proxy_local, summarize
+        from ui.selfcheck_dialog import show_results
 
         url = ""
         for sub in self.node_store.subscriptions:

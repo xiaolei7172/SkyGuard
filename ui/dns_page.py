@@ -96,7 +96,7 @@ class DnsPage(QWidget):
         self._adapters = []
         self._probing = False
         self._updating_lists = False
-        self.ui_call.connect(lambda f: f())
+        self.ui_call.connect(self._dispatch_ui)
         self.setup_ui()
         self._rebuild_filter_rules()
 
@@ -107,6 +107,13 @@ class DnsPage(QWidget):
     def _ui(self, func):
         """线程安全地把界面更新投递回主线程。"""
         self.ui_call.emit(func)
+
+    def _dispatch_ui(self, func):
+        """主线程执行回调；回调出错只记日志，避免"进行中"标记永久卡住。"""
+        try:
+            func()
+        except Exception as e:
+            logger.error(f"DNS 页界面回调失败: {e}")
 
     def on_tab_changed(self, index):
         """切到日志页时立即刷新一次，不等 2 秒轮询。"""
@@ -832,8 +839,10 @@ class DnsPage(QWidget):
                 items = check_dns(upstream=upstream)
             except Exception as e:  # 自检本身异常也要回到界面
                 logger.warning(f"DNS 自检异常: {e}")
-                items = []
-                self._ui(lambda: self._after_selfcheck(items, str(e)))
+                # 先转成字符串再投递：except 结束时 e 会被删除，
+                # lambda 到主线程执行时再 str(e) 会 NameError（自检按钮永久禁用）
+                err_text = str(e)
+                self._ui(lambda: self._after_selfcheck([], err_text))
                 return
             self._ui(lambda: self._after_selfcheck(items, None))
 
@@ -1541,6 +1550,13 @@ class DnsPage(QWidget):
 
 
 def threading_run(func):
-    """简单线程包装：所有耗时操作丢后台。"""
+    """简单线程包装：所有耗时操作丢后台。异常只记日志，不让线程静默死掉。"""
     import threading
-    threading.Thread(target=func, daemon=True).start()
+
+    def runner():
+        try:
+            func()
+        except Exception as e:
+            logger.error(f"DNS 页后台任务失败: {e}")
+
+    threading.Thread(target=runner, daemon=True).start()

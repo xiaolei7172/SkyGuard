@@ -6,7 +6,12 @@
 """
 
 import os
+import tempfile
+import threading
+import time
+
 import yaml
+
 from utils.logger import logger
 from config.app_config import APP_INFO, DEFAULT_CONFIG, SYSTEM_CONFIG
 
@@ -14,6 +19,36 @@ from config.app_config import APP_INFO, DEFAULT_CONFIG, SYSTEM_CONFIG
 # utils.system_utils 也依赖 config.app_config，顶层互相导入会形成
 # utils.system_utils ↔ config.config_manager 循环（懒加载场景下会触发 ImportError），
 # 统一在使用处函数内导入。
+
+# 配置文件写盘锁：界面线程与内存清理线程都会 save_config，
+# 两个 open(...,"w") 交错会让 YAML 被截断成半截。
+_save_lock = threading.Lock()
+
+
+def _write_text_atomic(path, text):
+    """原子写文本：临时文件 + fsync + os.replace（同目录保证同卷）。
+
+    进程崩在写盘中间时，磁盘上要么是旧的完整配置，要么是新的完整配置，
+    不会出现空文件/半截 YAML。
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    tmp_path = None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 class ConfigManager:
@@ -311,6 +346,9 @@ class ConfigManager:
                 return True
             except Exception as e:
                 logger.error(f"加载配置文件失败: {str(e)}")
+                # 先把坏文件改名保留：直接写默认配置会把用户的节点、自定义规则、
+                # 改写表全部清空且不可恢复
+                self._quarantine_config_file()
                 # 使用默认配置
                 self._create_default_config()
                 return False
@@ -320,12 +358,24 @@ class ConfigManager:
             self._create_default_config()
             return True
 
+    def _quarantine_config_file(self):
+        """把无法解析的配置文件改名保留（.corrupt.时间戳），便于事后手动找回。"""
+        try:
+            if not os.path.exists(self.config_file):
+                return
+            target = f"{self.config_file}.corrupt.{time.strftime('%Y%m%d_%H%M%S')}"
+            os.replace(self.config_file, target)
+            logger.warning(f"损坏的配置文件已保留为 {os.path.basename(target)}，可手动修复后改名回 config.yaml")
+        except OSError as e:
+            logger.warning(f"保留损坏配置文件失败: {e}")
+
     def _create_default_config(self):
         """创建默认配置文件"""
         try:
-            # 使用默认配置
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                yaml.dump(self.default_config, f, default_flow_style=False, allow_unicode=True)
+            # 使用默认配置（同样原子写，避免创建过程中被打断又留下坏文件）
+            text = yaml.dump(self.default_config, default_flow_style=False, allow_unicode=True)
+            with _save_lock:
+                _write_text_atomic(self.config_file, text)
 
             # 从默认配置中重新加载设置
             self.show_notifications = self.default_config["notifications"]["enabled"]
@@ -449,9 +499,10 @@ class ConfigManager:
                 },
             }
 
-            # 保存到文件
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                yaml.dump(config_data, f, default_flow_style=False, allow_unicode=True)
+            # 保存到文件（原子写：崩溃/断电不会留下半截 YAML）
+            text = yaml.dump(config_data, default_flow_style=False, allow_unicode=True)
+            with _save_lock:
+                _write_text_atomic(self.config_file, text)
 
             logger.debug("配置已保存")
             return True

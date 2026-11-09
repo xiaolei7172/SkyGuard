@@ -14,8 +14,6 @@ import hashlib
 import os
 import time
 
-import requests
-
 from core.dns_rules import parse_filter_list
 from utils.logger import logger
 
@@ -60,6 +58,7 @@ def read_list_text(url):
     if os.path.exists(url):
         with open(url, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
+    import requests        # 懒导入：只有真的要从网上拉列表才需要 requests
     resp = requests.get(url, timeout=20,
                         headers={"User-Agent": "SkyGuard-DNS/1.2 (+adguard-compatible)"})
     resp.raise_for_status()

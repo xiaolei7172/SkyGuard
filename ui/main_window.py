@@ -52,10 +52,8 @@ from utils import (
 from ui.process_io_priority_manager import show_process_io_priority_manager
 from ui.components.custom_titlebar import CustomTitleBar
 from ui.floating_window import create_floating_window
-from ui.dns_page import DnsPage
 from ui.accel_page import AccelPage
 from ui.pages import DiskCleanPage, StartupPage
-from ui.pages.stats_page import StatsPage
 from ui.styles import (
     ColorScheme,
     StyleHelper,
@@ -148,6 +146,11 @@ class MainWindow(QWidget):
     stop_progress_signal = Signal(int)
     stop_result_signal = Signal(str, int, int)
 
+    # 定时任务线程 → 主线程：优选结果落盘后刷新加速页缓存
+    ip_refreshed_signal = Signal()
+    # 定时任务线程 → 主线程：完成提示走系统通知（winrt 对线程环境敏感，统一在主线程发）
+    scheduled_notify_signal = Signal(str)
+
     def __init__(self, config_manager, monitor=None, icon_path=None, start_minimized=False):
         super().__init__()
 
@@ -204,6 +207,9 @@ class MainWindow(QWidget):
 
         # 定时自动化任务巡检线程（每分钟看一次有没有到点；开关在设置页）
         from utils.scheduled_tasks import ScheduledTaskManager
+        # 信号跨线程自动排队，定时任务线程 emit → 主线程槽执行
+        self.ip_refreshed_signal.connect(self._reload_accel_ip_cache)
+        self.scheduled_notify_signal.connect(self._show_scheduled_notification)
         self.scheduled_tasks = ScheduledTaskManager(
             self.config_manager, notify=self._notify_scheduled,
             on_ip_refreshed=self._on_scheduled_ip_refreshed)
@@ -894,13 +900,23 @@ class MainWindow(QWidget):
         disk_placeholder = QWidget()
         self._lazy_pages[disk_placeholder] = (
             lambda: DiskCleanPage(), "  🧹 垃圾清理  ", "disk_clean_page")
+
+        def _make_dns_page():
+            # 模块内导入：dns_page 会拖进 dns_filter + requests（约 55ms），
+            # 而这一页本来就是切过去才创建的
+            from ui.dns_page import DnsPage
+            return DnsPage(self.config_manager)
+
+        def _make_stats_page():
+            from ui.pages.stats_page import StatsPage
+            return StatsPage(config_manager=self.config_manager)
+
         dns_placeholder = QWidget()
         self._lazy_pages[dns_placeholder] = (
-            lambda: DnsPage(self.config_manager), "  🛡 DNS 过滤器  ", "dns_page")
+            _make_dns_page, "  🛡 DNS 过滤器  ", "dns_page")
         stats_placeholder = QWidget()
         self._lazy_pages[stats_placeholder] = (
-            lambda: StatsPage(config_manager=self.config_manager),
-            "  📈 统计中心  ", "stats_page")
+            _make_stats_page, "  📈 统计中心  ", "stats_page")
 
         # 添加选项卡
         self.tabs.addTab(status_tab, "  程序状态  ")
@@ -2156,19 +2172,35 @@ class MainWindow(QWidget):
             logger.warning("日志保留天数保存失败，本次修改仅在当前会话生效")
 
     def _on_scheduled_ip_refreshed(self):
-        """定时优选写完盘：让加速页重新加载缓存（回调来自后台线程，切回主线程）。"""
-        def apply():
-            page = getattr(self, "accel_page", None)
-            if page is None:
-                return
-            try:
-                page.reload_ip_cache()
-            except Exception as e:
-                logger.debug(f"刷新加速页优选缓存失败: {e}")
-        QTimer.singleShot(0, apply)
+        """定时优选写完盘：让加速页重新加载缓存（回调来自后台线程，切回主线程）。
+
+        注意不能在这里用 QTimer.singleShot —— 它只在调用线程的事件循环里计时，
+        后台线程没有事件循环，定时器永远不会触发（表现为"运行中的代理用不到新 IP"）。
+        """
+        try:
+            self.ip_refreshed_signal.emit()
+        except RuntimeError:
+            pass    # 窗口已销毁
+
+    def _reload_accel_ip_cache(self):
+        """主线程槽：加速页重新读盘并刷新表格。"""
+        page = getattr(self, "accel_page", None)
+        if page is None:
+            return
+        try:
+            page.reload_ip_cache()
+        except Exception as e:
+            logger.debug(f"刷新加速页优选缓存失败: {e}")
 
     def _notify_scheduled(self, message):
-        """定时任务完成提示（走系统通知，受通知开关控制）。"""
+        """定时任务完成提示（回调来自后台线程 → 投递到主线程再发通知）。"""
+        try:
+            self.scheduled_notify_signal.emit(message)
+        except RuntimeError:
+            pass    # 窗口已销毁
+
+    def _show_scheduled_notification(self, message):
+        """主线程槽：真正发送系统通知（受通知开关控制）。"""
         try:
             if getattr(self.config_manager, "show_notifications", False):
                 send_notification(title="SkyGuard 定时任务", message=message,

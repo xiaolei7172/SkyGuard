@@ -160,7 +160,9 @@ def record_clean(report):
     轮转一次数字就会倒退。
     """
     ensure_totals_seeded()      # 历史先入账，避免首次清理时把老报告漏掉
-    with _daily_lock:
+    # 累加账用 _totals_lock：和 ensure_totals_seeded 抢同一把锁，
+    # 原来这里用 _daily_lock 保护 TOTALS_FILE，播种与累加可能交错丢计数
+    with _totals_lock:
         totals = atomic_io.read_json(TOTALS_FILE, default=None, expect=dict) or {}
         totals["count"] = int(totals.get("count", 0)) + 1
         totals["total_size"] = (int(totals.get("total_size", 0))

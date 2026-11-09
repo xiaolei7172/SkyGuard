@@ -9,10 +9,12 @@ from PySide6.QtCore import QObject, Signal
 import json
 import re
 import os
-import requests
 import threading
 from packaging import version
 from .logger import logger
+
+# requests 及其 charset_normalizer 依赖占导入时间约 250ms（占启动导入链 1/3），
+# 而本模块只在真正检查更新时才用到，故在 _check_for_updates_thread 内导入。
 
 
 class VersionChecker(QObject):
@@ -60,6 +62,7 @@ class VersionChecker(QObject):
         """
         检查更新的线程函数
         """
+        import requests    # 懒导入，避免拖慢启动（见模块头部说明）
         try:
             current_ver = self.get_current_version()
 

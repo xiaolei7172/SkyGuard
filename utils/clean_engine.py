@@ -477,16 +477,28 @@ class CleanEngine:
                 ok_f, fail_f = self._delete_permanently(files)
                 ok_d, fail_d = self._delete_permanently(dirs)
 
+            # 有文件被占用/无权限时，上面统计的 size 是"扫描到的总量"，
+            # 直接记成"已释放"会让统计中心的累计值虚高。按"仍然存在的大小"倒扣。
+            freed = size
+            if (fail_f or fail_d) and files:
+                still = 0
+                for p in files:
+                    try:
+                        still += os.path.getsize(p)   # 还在 = 没删掉
+                    except OSError:
+                        pass
+                freed = max(0, size - still)
+
             entry.update({
-                "files": ok_f, "size": size, "dirs": ok_d,
+                "files": ok_f, "size": freed, "dirs": ok_d,
                 "note": "" if (fail_f + fail_d) == 0 else f"{fail_f + fail_d} 项被占用/无权限跳过",
             })
             report["total_files"] += ok_f
             report["total_dirs"] += ok_d
-            report["total_size"] += size
+            report["total_size"] += freed
             report["failures"] += fail_f + fail_d
             report["rules"].append(entry)
-            logger.info(f"清理 {rule['name']}：{ok_f} 个文件 / {ok_d} 个目录 / {size/1024/1024:.1f} MB")
+            logger.info(f"清理 {rule['name']}：{ok_f} 个文件 / {ok_d} 个目录 / {freed/1024/1024:.1f} MB")
 
         if progress:
             progress("清理完成", 100)

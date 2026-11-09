@@ -24,7 +24,6 @@ import threading
 import time
 from collections import Counter, deque
 
-import requests
 
 from core.dns_rules import RuleSet, compile_rules
 from utils.logger import logger
@@ -159,6 +158,7 @@ class Upstream:
         return self._recv_exact(tls, length)
 
     def _query_doh(self, wire_query, timeout):
+        import requests    # 懒导入：DNS 起 UDP/TCP 服务不需要 requests
         # requests.Session 非线程安全：DNS handler 是多线程，
         # 用 thread-local 各持一份连接池（底层 urllib3 池无法跨 Session 共享）
         session = getattr(self._doh_local, "session", None)
@@ -965,6 +965,8 @@ class DnsFilter:
     # ---------------- 订阅更新 ----------------
     def update_subscription(self, url="https://anti-ad.net/hosts", timeout=30):
         """下载 hosts 格式订阅并转为黑名单文件，返回（条数, 错误信息）。"""
+        import requests
+
         try:
             resp = requests.get(url, timeout=timeout,
                                 headers={"User-Agent": "SkyGuard-DnsFilter/1.0"})

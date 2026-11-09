@@ -175,6 +175,11 @@ class StatsPage(QWidget):
 
     def _fill_daily(self, rows):
         head = rows[-1] if rows else {}
+        # 汇总行必须在"数据没变就跳过重建"之前更新：
+        # refresh() 会先把提示改成"正在统计…"，跳过了就永远停在"正在统计…"
+        active_days = sum(1 for r in rows if r["dns_queries"] or r["proxy_total"])
+        self.summary_label.setText(f"共 {len(rows)} 天记录，其中 {active_days} 天有活动")
+
         sig = tuple((r["date"], r["dns_queries"], r["dns_blocked"],
                      r["proxy_total"], r["proxy_up"], r["proxy_down"])
                     for r in rows)
@@ -203,10 +208,6 @@ class StatsPage(QWidget):
                 if c > 0:
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.daily_table.setItem(r, c, cell)
-
-        active_days = sum(1 for r in rows
-                          if r["dns_queries"] or r["proxy_total"])
-        self.summary_label.setText(f"共 {len(rows)} 天记录，其中 {active_days} 天有活动")
 
     def showEvent(self, event):
         super().showEvent(event)

@@ -138,9 +138,17 @@ def download_kernel(dest_dir=None, progress=None):
     dest_dir = dest_dir or user_kernel_dir()
     os.makedirs(dest_dir, exist_ok=True)
 
-    token = ""
+    # 可选私有 token（GitHub API 限流 60 次/小时，够用；有 token 就带上）
     token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               os.pardir, ".gh_token")
+    token = ""
+    if os.path.isfile(token_file):
+        try:
+            with open(token_file, encoding="utf-8") as f:
+                token = f.read().strip()
+        except OSError:
+            token = ""
+
     proxies = urllib.request.getproxies() or None
     if proxies:
         handler = urllib.request.ProxyHandler(
@@ -151,14 +159,13 @@ def download_kernel(dest_dir=None, progress=None):
 
     req = urllib.request.Request(GITHUB_LATEST)
     req.add_header("Accept", "application/vnd.github+json")
-    if token and os.path.isfile(os.path.abspath(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), os.pardir, ".gh_token"))):
-        with open(token_file, encoding="utf-8") as f:
-            token = f.read().strip()
+    if token:
         req.add_header("Authorization", f"token {token}")
 
     def fetch(request, timeout=60):
-        return opener.open(request, timeout=timeout).read()
+        # 必须关闭响应，否则每次请求都留一个未释放的连接
+        with opener.open(request, timeout=timeout) as resp:
+            return resp.read()
 
     data = json.loads(fetch(req))
     release_tag = data.get("tag_name", "")
@@ -182,7 +189,6 @@ def download_kernel(dest_dir=None, progress=None):
     if progress:
         progress(f"下载 {asset['name']} …")
     zip_path = os.path.join(dest_dir, "mihomo_download.zip")
-    last = [0]
 
     # urlretrieve 没有超时参数，网络卡住会永久挂起；改用 urlopen 分块下载
     req = urllib.request.Request(url)

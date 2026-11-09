@@ -23,7 +23,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import requests
 
 from utils import atomic_io
 from utils.logger import logger
@@ -103,6 +102,7 @@ def cache_path():
 # DNS 查询
 # ----------------------------------------------------------------------
 def _doh_query(name, url, headers, timeout=6.0, session=None):
+    import requests      # 懒导入：只有真正发起 DoH 查询才需要
     """查询单个 DoH 提供方，返回 A 记录列表。"""
     getter = session.get if session is not None else requests.get
     try:
@@ -135,6 +135,8 @@ def _valid_ipv4(text):
 
 def resolve_candidates(domain, timeout=6.0):
     """从全部 DoH 出口汇总候选 IP，返回 [(ip, 来源)]，已去重。"""
+    import requests
+
     found = {}
     session = requests.Session()
     try:
@@ -148,6 +150,8 @@ def resolve_candidates(domain, timeout=6.0):
 
 def fetch_community_hosts(timeout=10.0):
     """拉取社区 hosts 池，返回 {domain: [ip,...]}；失败返回空字典。"""
+    import requests
+
     result = {}
     try:
         resp = requests.get(COMMUNITY_HOSTS_URL, timeout=timeout)
@@ -228,14 +232,22 @@ def optimize_domains(domains, port=443, top_n=3, max_workers=8, progress=None):
     counter = {"done": 0}
     lock = threading.Lock()
 
-    # 社区 hosts 源可能被墙，放到后台拉，拉不到就不等它，避免整个测速卡住
+    # 社区 hosts 源可能被墙：给 3 秒窗口，拿不到就不等它
+    community_ready = threading.Event()
+
     def load_community():
         try:
             community.update(fetch_community_hosts(timeout=5))
         except Exception:
             pass
+        finally:
+            community_ready.set()
 
-    threading.Thread(target=load_community, daemon=True).start()
+    loader = threading.Thread(target=load_community, daemon=True)
+    loader.start()
+    # 原来起完线程立刻开始测速，community 基本还是空的，extra_ips 永远拿不到。
+    # 这里最多等 3 秒：社区源通就顺带补候选，不通就按 DoH 结果继续。
+    community_ready.wait(3.0)
 
     def work(domain):
         extra = community.get(domain)
@@ -260,13 +272,19 @@ def optimize_domains(domains, port=443, top_n=3, max_workers=8, progress=None):
 # 缓存（代理的加速规则直接读这里）
 # ----------------------------------------------------------------------
 class IpCache:
-    """优选 IP 缓存，线程安全，供代理规则实时查询。"""
+    """优选 IP 缓存，线程安全，供代理规则实时查询。
+
+    锁是**类级共享**的：界面上有实例、定时任务里有另一个实例，两者都做
+    「读盘 → 合并 → 写盘」。实例级锁各管各的，交错执行时后写的会把先写的
+    新结果回滚掉（正是这个类要修的问题）。
+    """
+
+    _lock = threading.RLock()
 
     def __init__(self, path=None, max_age=6 * 3600):
         self.path = path or cache_path()
         self.max_age = max_age
         self.data = {}          # domain -> {"ips": [...], "ts": int}
-        self._lock = threading.RLock()
         self.load()
 
     def load(self, merge=True):
@@ -327,8 +345,11 @@ class IpCache:
             if time.time() - item.get("ts", 0) > self.max_age:
                 return None
             for entry in item.get("ips") or []:
-                if _valid_ipv4(str(entry.get("ip", ""))):
-                    return entry["ip"]
+                # 兼容老格式/手工编辑过的缓存（ips 里直接放字符串）：
+                # 这里在代理解析热路径上，抛异常会让整条连接直接 502
+                ip = entry.get("ip") if isinstance(entry, dict) else entry
+                if _valid_ipv4(str(ip or "")):
+                    return ip
         return None
 
     def best_for_suffix(self, domain):
@@ -360,8 +381,12 @@ class IpCache:
         with self._lock:
             for domain, item in self.data.items():
                 ips = item.get("ips") or []
-                if ips:
-                    pairs.append((domain, ips[0]["ip"]))
+                if not ips:
+                    continue
+                first = ips[0]
+                ip = first.get("ip") if isinstance(first, dict) else first
+                if _valid_ipv4(str(ip or "")):
+                    pairs.append((domain, ip))
         pairs.sort()
         return pairs
 
