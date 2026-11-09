@@ -148,7 +148,6 @@ jobs:
             --include-data-files=$icon_path=favicon.ico `
             --include-data-dir=assets/icon=assets/icon `
             --include-data-dir=data=data `
-            --windows-uac-as-invoker `
             --company-name="xiaolei7172" `
             --product-name="SkyGuard" `
             --file-description="SkyGuard 天幕进程优化工具" `
@@ -209,6 +208,18 @@ jobs:
               if ($check.Path -eq "main.dist/$env:APP_NAME.exe") { exit 1 }
             }
           }
+
+          # UAC 清单校验：不传 --windows-uac-admin 时 Nuitka 默认生成 asInvoker，
+          # 双击不弹 UAC（提权由程序内弹窗负责）。防止将来误加提权参数造成回归。
+          $exeBytes = [System.IO.File]::ReadAllBytes("main.dist/$env:APP_NAME.exe")
+          $exeText = [System.Text.Encoding]::ASCII.GetString($exeBytes)
+          if ($exeText -match "requireAdministrator") {
+            Write-Error "❌ exe 清单包含 requireAdministrator，不符合『不自动提权』要求"; exit 1
+          }
+          if ($exeText -notmatch "asInvoker") {
+            Write-Error "❌ exe 清单缺少 asInvoker 执行级别"; exit 1
+          }
+          Write-Host "✅ UAC 清单为 asInvoker（双击不弹 UAC）"
 
           Write-Host "🎉 构建验证完成！"
         shell: pwsh
