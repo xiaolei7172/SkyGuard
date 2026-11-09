@@ -34,6 +34,9 @@ from utils.logger import logger
 ACTION_DIRECT = "DIRECT"
 ACTION_PROXY = "PROXY"
 ACTION_REJECT = "REJECT"
+
+# 每条连接固定 3 个线程（client + 两个转发方向），设上限防止被扫描打爆
+MAX_CONNECTIONS = 256
 ACTION_ACCEL = "ACCEL"
 
 MODE_RULE = "rule"
@@ -379,10 +382,23 @@ class LocalProxy:
                 continue
             except OSError:
                 break
+            reject = False
             with self._conns_lock:
-                self._conn_seq += 1
-                conn_id = self._conn_seq
-                self._conns[conn_id] = client
+                # 每条连接 3 个线程，不设上限时（尤其 allow_lan 暴露到局域网）
+                # 端口扫描就能把线程数打爆
+                if len(self._conns) >= MAX_CONNECTIONS:
+                    reject = True
+                else:
+                    self._conn_seq += 1
+                    conn_id = self._conn_seq
+                    self._conns[conn_id] = client
+            if reject:
+                logger.debug(f"代理连接数已达上限 {MAX_CONNECTIONS}，拒绝新连接")
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                continue
             threading.Thread(target=self._handle_client, args=(client, conn_id),
                              daemon=True).start()
 
