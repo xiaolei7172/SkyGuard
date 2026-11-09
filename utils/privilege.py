@@ -5,10 +5,8 @@
 管理员权限提示模块
 
 SkyGuard 的以下功能需要管理员权限：
-  - 写 hosts（GitHub / Steam 优选 IP 加速）
   - 接管 / 恢复系统 DNS（netsh 修改网卡 DNS）
   - 监听 53 端口的本地 DNS 服务（1024 以下端口需要管理员）
-  - 设置 / 恢复系统代理（部分系统策略下需要）
 
 本模块提供两种提示：
   1. prompt_elevate_on_startup()  启动前的原生弹窗（此时还没有 QApplication）
@@ -22,10 +20,8 @@ from utils.system_utils import is_admin, relaunch_as_admin
 
 # 需要管理员权限的具体功能，用于提示文案
 ADMIN_ONLY_FEATURES = (
-    "写入 hosts 加速 GitHub / Steam",
     "接管与恢复系统 DNS",
     "在 53 端口启动本地 DNS 服务",
-    "修改系统代理（受组策略限制时需要）",
 )
 
 MB_YESNO = 0x00000004

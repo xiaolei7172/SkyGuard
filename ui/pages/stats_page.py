@@ -62,8 +62,7 @@ class StatsPage(QWidget):
         self.card_total, self.lbl_total = _card("累计释放空间", "—")
         self.card_count, self.lbl_count = _card("清理次数", "—")
         self.card_dns, self.lbl_dns = _card("今日 DNS 查询 / 拦截", "—")
-        self.card_proxy, self.lbl_proxy = _card("今日代理连接 / 流量", "—")
-        for card in (self.card_total, self.card_count, self.card_dns, self.card_proxy):
+        for card in (self.card_total, self.card_count, self.card_dns):
             cards_row.addWidget(card, 1)
         layout.addLayout(cards_row)
 
@@ -85,11 +84,11 @@ class StatsPage(QWidget):
         layout.addWidget(clean_group, 3)
 
         # 每日用量
-        daily_group = QGroupBox(f"近 {DAILY_DAYS} 天每日用量（DNS 查询/拦截 · 代理连接/流量）")
+        daily_group = QGroupBox(f"近 {DAILY_DAYS} 天每日用量（DNS 查询 / 拦截）")
         daily_lay = QVBoxLayout()
-        self.daily_table = QTableWidget(0, 6)
+        self.daily_table = QTableWidget(0, 3)
         self.daily_table.setHorizontalHeaderLabels(
-            ["日期", "DNS 查询", "DNS 拦截", "代理连接", "上行", "下行"])
+            ["日期", "DNS 查询", "DNS 拦截"])
         self.daily_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch)
         self.daily_table.setEditTriggers(
@@ -177,11 +176,10 @@ class StatsPage(QWidget):
         head = rows[-1] if rows else {}
         # 汇总行必须在"数据没变就跳过重建"之前更新：
         # refresh() 会先把提示改成"正在统计…"，跳过了就永远停在"正在统计…"
-        active_days = sum(1 for r in rows if r["dns_queries"] or r["proxy_total"])
+        active_days = sum(1 for r in rows if r["dns_queries"])
         self.summary_label.setText(f"共 {len(rows)} 天记录，其中 {active_days} 天有活动")
 
-        sig = tuple((r["date"], r["dns_queries"], r["dns_blocked"],
-                     r["proxy_total"], r["proxy_up"], r["proxy_down"])
+        sig = tuple((r["date"], r["dns_queries"], r["dns_blocked"])
                     for r in rows)
         if sig == self._daily_sig:
             return
@@ -189,9 +187,6 @@ class StatsPage(QWidget):
 
         self.lbl_dns.setText(
             f"{head.get('dns_queries', 0):,} / {head.get('dns_blocked', 0):,}")
-        self.lbl_proxy.setText(
-            f"{head.get('proxy_total', 0):,} · ↑{format_size(head.get('proxy_up', 0))}"
-            f" ↓{format_size(head.get('proxy_down', 0))}")
 
         self.daily_table.setRowCount(len(rows))
         for r, item in enumerate(rows):
@@ -199,9 +194,6 @@ class StatsPage(QWidget):
                 item["date"],
                 f"{item['dns_queries']:,}",
                 f"{item['dns_blocked']:,}",
-                f"{item['proxy_total']:,}",
-                format_size(item["proxy_up"]),
-                format_size(item["proxy_down"]),
             ]
             for c, text in enumerate(values):
                 cell = QTableWidgetItem(str(text))

@@ -45,9 +45,7 @@ DEFAULT_CONFIG = {
     },
     "schedule": {
         "auto_clean_enabled": False,          # 定时自动清理默认关闭
-        "auto_clean_days": 7,                 # 自动清理间隔（天）
-        "auto_ip_enabled": False,             # 每日自动重测优选 IP 默认关闭
-        "auto_ip_hour": 3                     # 自动优选触发小时（24 小时制）
+        "auto_clean_days": 7                  # 自动清理间隔（天）
     },
     "io_priority": {
         "processes": [                        # 需要自动设置I/O优先级的进程名列表
@@ -70,25 +68,7 @@ DEFAULT_CONFIG = {
             "temp": True
         }
     },
-    "proxy": {
-        "enabled": False,                     # 本地代理服务默认不随程序启动
-        "mode": "smart",                      # smart=国内直连国外代理 / rule=按规则 / global=全走节点 / direct=全直连
-        "host": "127.0.0.1",
-        "port": 7890,                         # 与 Clash 默认 mixed 端口一致，便于习惯迁移
-        "allow_lan": False,                   # True 时监听 0.0.0.0，局域网可用
-        "set_system_proxy": True,             # 启动代理时顺带接管系统代理
-        "selected_node": "",                  # 选中节点的 uid（空表示没有节点）
-        "engine": "builtin",                  # builtin=内置引擎 / clash=mihomo 内核（支持 hysteria2/vless 等全部协议）
-        "kernel_path": "",                    # mihomo 内核路径，空表示自动查找/下载
-        "clash_api_port": 19090,              # mihomo RESTful API 端口
-        "rules": [],                          # 空列表表示使用内置默认规则
-        "accel_groups": {                     # 优选 IP 覆盖范围
-            "github": True,
-            "steam": True
-        },
-        "extra_domains": [],                  # 额外需要优选的域名
-        "top_n": 3                            # 每个域名保留几个优选 IP
-    },
+    "proxy": {},                          # 已废弃：网络加速板块已移除，保留空段兼容旧配置文件
     "dns_filter": {
         "enabled": False,                     # DNS 过滤服务默认不随程序启动
         "port": 53,

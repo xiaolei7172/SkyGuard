@@ -123,8 +123,6 @@ class ConfigManager:
         schedule = self.default_config["schedule"]
         self.schedule_auto_clean_enabled = schedule["auto_clean_enabled"]
         self.schedule_auto_clean_days = schedule["auto_clean_days"]
-        self.schedule_auto_ip_enabled = schedule["auto_ip_enabled"]
-        self.schedule_auto_ip_hour = schedule["auto_ip_hour"]
 
         # 悬浮窗设置
         floating = self.default_config["floating_window"]
@@ -138,9 +136,6 @@ class ConfigManager:
 
         # DNS 过滤器设置
         self._load_dns_config(self.default_config["dns_filter"])
-
-        # 网络加速（代理）设置
-        self._load_proxy_config(self.default_config["proxy"])
 
         # 确保配置目录存在
         self._ensure_directories()
@@ -321,13 +316,6 @@ class ConfigManager:
                             1, int(sched.get("auto_clean_days", self.schedule_auto_clean_days))))
                     except (TypeError, ValueError):
                         pass
-                    self.schedule_auto_ip_enabled = bool(
-                        sched.get("auto_ip_enabled", self.schedule_auto_ip_enabled))
-                    try:
-                        self.schedule_auto_ip_hour = min(23, max(
-                            0, int(sched.get("auto_ip_hour", self.schedule_auto_ip_hour))))
-                    except (TypeError, ValueError):
-                        pass
                     logger.debug("已从配置文件加载定时任务设置")
 
                 # 读取悬浮窗设置（旧版配置文件没有这一段，保持默认即可）
@@ -337,10 +325,6 @@ class ConfigManager:
                 # 读取 DNS 过滤器设置
                 if isinstance(config_data.get("dns_filter"), dict):
                     self._load_dns_config(config_data["dns_filter"])
-
-                # 读取网络加速设置
-                if isinstance(config_data.get("proxy"), dict):
-                    self._load_proxy_config(config_data["proxy"])
 
                 logger.debug("配置文件加载成功")
                 return True
@@ -403,17 +387,12 @@ class ConfigManager:
             schedule = self.default_config["schedule"]
             self.schedule_auto_clean_enabled = schedule["auto_clean_enabled"]
             self.schedule_auto_clean_days = schedule["auto_clean_days"]
-            self.schedule_auto_ip_enabled = schedule["auto_ip_enabled"]
-            self.schedule_auto_ip_hour = schedule["auto_ip_hour"]
 
             # 加载悬浮窗默认设置
             self._load_floating_config(self.default_config["floating_window"])
 
             # 加载 DNS 过滤器默认设置
             self._load_dns_config(self.default_config["dns_filter"])
-
-            # 加载网络加速默认设置
-            self._load_proxy_config(self.default_config["proxy"])
 
             logger.debug("已创建并加载默认配置")
         except Exception as e:
@@ -454,8 +433,6 @@ class ConfigManager:
                 "schedule": {
                     "auto_clean_enabled": self.schedule_auto_clean_enabled,
                     "auto_clean_days": self.schedule_auto_clean_days,
-                    "auto_ip_enabled": self.schedule_auto_ip_enabled,
-                    "auto_ip_hour": self.schedule_auto_ip_hour,
                 },
                 "floating_window": {
                     "enabled": self.floating_enabled,
@@ -480,22 +457,6 @@ class ConfigManager:
                     "lists": self.dns_lists,
                     "custom_rules": self.dns_custom_rules,
                     "rewrites": self.dns_rewrites,
-                },
-                "proxy": {
-                    "enabled": self.proxy_enabled,
-                    "mode": self.proxy_mode,
-                    "host": self.proxy_host,
-                    "port": self.proxy_port,
-                    "allow_lan": self.proxy_allow_lan,
-                    "set_system_proxy": self.proxy_set_system_proxy,
-                    "selected_node": self.proxy_selected_node,
-                    "engine": self.proxy_engine,
-                    "kernel_path": self.proxy_kernel_path,
-                    "clash_api_port": self.proxy_clash_api_port,
-                    "rules": self.proxy_rules,
-                    "accel_groups": self.proxy_accel_groups,
-                    "extra_domains": self.proxy_extra_domains,
-                    "top_n": self.proxy_top_n,
                 },
             }
 
@@ -637,102 +598,6 @@ class ConfigManager:
     # ------------------------------------------------------------------
     # 网络加速（本地代理）
     # ------------------------------------------------------------------
-    def _load_proxy_config(self, cfg):
-        """加载代理设置，旧配置文件没有这一段时全部走默认值。"""
-        default = self.default_config["proxy"]
-
-        def as_bool(key):
-            return bool(cfg.get(key, default[key]))
-
-        self.proxy_enabled = as_bool("enabled")
-        self.proxy_set_system_proxy = as_bool("set_system_proxy")
-        self.proxy_allow_lan = as_bool("allow_lan")
-
-        mode = str(cfg.get("mode", default["mode"])).lower()
-        self.proxy_mode = mode if mode in ("smart", "rule", "global", "direct") else default["mode"]
-
-        host = str(cfg.get("host", default["host"])).strip()
-        self.proxy_host = host or default["host"]
-        try:
-            self.proxy_port = min(65535, max(1, int(cfg.get("port", default["port"]))))
-        except (TypeError, ValueError):
-            self.proxy_port = default["port"]
-
-        self.proxy_selected_node = str(cfg.get("selected_node", "") or "")
-
-        engine = str(cfg.get("engine", default.get("engine", "builtin"))).strip().lower()
-        self.proxy_engine = engine if engine in ("builtin", "clash") else "builtin"
-        self.proxy_kernel_path = str(cfg.get("kernel_path", "") or "").strip()
-        try:
-            self.proxy_clash_api_port = min(65535, max(1024, int(cfg.get("clash_api_port", default.get("clash_api_port", 19090)))))
-        except (TypeError, ValueError):
-            self.proxy_clash_api_port = 19090
-
-        rules = cfg.get("rules")
-        if isinstance(rules, list) and rules:
-            cleaned = []
-            for rule in rules:
-                if not isinstance(rule, dict):
-                    continue
-                cleaned.append({
-                    "type": str(rule.get("type", "")).strip().lower(),
-                    "value": str(rule.get("value", "")).strip(),
-                    "action": str(rule.get("action", "")).strip().upper(),
-                })
-            self.proxy_rules = cleaned
-        else:
-            self.proxy_rules = []
-
-        groups = cfg.get("accel_groups")
-        merged = dict(default["accel_groups"])
-        if isinstance(groups, dict):
-            for key in merged:
-                if key in groups:
-                    merged[key] = bool(groups[key])
-        self.proxy_accel_groups = merged
-
-        extra = cfg.get("extra_domains")
-        if isinstance(extra, list):
-            self.proxy_extra_domains = [str(d).strip() for d in extra if str(d).strip()]
-        else:
-            self.proxy_extra_domains = []
-
-        try:
-            self.proxy_top_n = min(8, max(1, int(cfg.get("top_n", default["top_n"]))))
-        except (TypeError, ValueError):
-            self.proxy_top_n = default["top_n"]
-
-        logger.debug(f"已加载网络加速设置: 端口={self.proxy_port} 模式={self.proxy_mode} "
-                     f"规则={len(self.proxy_rules) or '默认'}")
-
-    def _save_proxy(self):
-        if not self.save_config():
-            logger.warning("网络加速设置保存失败，本次修改仅在当前会话生效")
-
-    def set_proxy_config(self, **kwargs):
-        """批量更新代理配置项并落盘。"""
-        mapping = {
-            "enabled": "proxy_enabled",
-            "mode": "proxy_mode",
-            "host": "proxy_host",
-            "port": "proxy_port",
-            "allow_lan": "proxy_allow_lan",
-            "set_system_proxy": "proxy_set_system_proxy",
-            "selected_node": "proxy_selected_node",
-            "engine": "proxy_engine",
-            "kernel_path": "proxy_kernel_path",
-            "clash_api_port": "proxy_clash_api_port",
-            "rules": "proxy_rules",
-            "accel_groups": "proxy_accel_groups",
-            "extra_domains": "proxy_extra_domains",
-            "top_n": "proxy_top_n",
-        }
-        for key, value in kwargs.items():
-            attr = mapping.get(key)
-            if attr:
-                setattr(self, attr, value)
-        self._save_proxy()
-
     def _save_dns(self):
         """DNS 过滤器设置变更后落盘。"""
         if not self.save_config():
@@ -772,8 +637,6 @@ class ConfigManager:
         mapping = {
             "auto_clean_enabled": "schedule_auto_clean_enabled",
             "auto_clean_days": "schedule_auto_clean_days",
-            "auto_ip_enabled": "schedule_auto_ip_enabled",
-            "auto_ip_hour": "schedule_auto_ip_hour",
         }
         for key, value in kwargs.items():
             attr = mapping.get(key)

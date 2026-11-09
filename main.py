@@ -16,7 +16,6 @@ from utils import (
     find_icon_path,
     create_notification_thread,
     is_admin,
-    prompt_elevate_on_startup,
     check_single_instance,
     get_io_priority_service,
     check_for_update,
@@ -45,20 +44,22 @@ def main(custom_app_info=None, custom_default_config=None, custom_system_config=
     if custom_system_config:
         final_system_config.update(custom_system_config)
 
-    # 管理员权限：先给出明确提示，由用户选择提权重启或以受限模式运行
+    # 管理员权限：程序不再主动申请，默认受限模式运行。
+    # 需要提权的功能（接管网卡 DNS / 53 端口服务）由用户在标题栏
+    # 「受限模式 · 点此提权」自行决定，也可以命令行传 --elevate 直接提权。
     restricted_mode = False
     if not is_admin():
-        if "--no-elevate" in sys.argv:
-            restricted_mode = True
-        else:
-            choice = prompt_elevate_on_startup(final_app_info["name"])
-            if choice == "elevated":
-                # 已把控制权交给新的管理员进程
-                return
-            restricted_mode = True
-        print("[SkyGuard] 受限模式：未获得管理员权限。"
-              "写 hosts / 接管系统 DNS / 53 端口 DNS 服务不可用，"
-              "可在标题栏点击「受限模式」重新提权。")
+        if "--elevate" in sys.argv:
+            from utils.system_utils import relaunch_as_admin
+            try:
+                relaunch_as_admin()
+                return    # 控制权已交给新的管理员进程
+            except Exception:
+                pass      # 提权失败（用户取消 UAC）则继续受限模式
+        restricted_mode = True
+        logger.info("受限模式启动：未获得管理员权限，"
+                    "接管系统 DNS / 53 端口服务不可用；"
+                    "需要时点击标题栏「受限模式」提权")
 
     # 检查单实例运行
     mutex_name = f"Global\\{final_app_info['name'].replace(' ', '_')}_MUTEX"

@@ -45,11 +45,9 @@ def _save_state(state):
 class ScheduledTaskManager:
     """后台分钟级巡检：到点就干，干完记账。"""
 
-    def __init__(self, config_manager, notify=None, on_ip_refreshed=None):
+    def __init__(self, config_manager, notify=None):
         self.config_manager = config_manager
         self.notify = notify or (lambda msg: None)  # 完成提示（通知/日志）
-        # 优选写完盘后回调，让 UI 重新加载缓存并刷新（实现方负责切回主线程）
-        self.on_ip_refreshed = on_ip_refreshed
         self.running = False
         self._thread = None
         self._stop_event = threading.Event()
@@ -88,26 +86,12 @@ class ScheduledTaskManager:
 
     def _tick(self):
         cfg = self.config_manager
-        # 两个开关都关时直接返回：默认配置就是全关，
+        # 开关关着时直接返回：默认配置就是全关，
         # 不该每分钟都去读一次状态文件
-        if not (cfg.schedule_auto_ip_enabled or cfg.schedule_auto_clean_enabled):
+        if not cfg.schedule_auto_clean_enabled:
             return
         state = _load_state()
         today = _today()
-
-        # 每日自动优选 IP：当天只尝试一次（成败都记账），
-        # 否则失败后会在整点那一小时里每分钟重跑一次全量测速
-        if cfg.schedule_auto_ip_enabled and state.get("ip_tried_date") != today:
-            if time.localtime().tm_hour == cfg.schedule_auto_ip_hour:
-                status = self._run_ip_refresh()
-                if status == "busy":
-                    return      # 另一个任务在跑，下一分钟再看
-                state["ip_tried_date"] = today
-                state["last_ip_result"] = status
-                if status == "ok":
-                    state["last_ip_date"] = today
-                _save_state(state)
-                return          # 一分钟只干一件事
 
         # 每 N 天自动清理：成功后按间隔再算；失败/被占用当天只试一次
         if cfg.schedule_auto_clean_enabled:
@@ -164,50 +148,3 @@ class ScheduledTaskManager:
         finally:
             self._work_lock.release()
 
-    def _run_ip_refresh(self):
-        """自动重测优选 IP 并刷新缓存。返回 ok / fail / busy。"""
-        if not self._work_lock.acquire(blocking=False):
-            return "busy"
-        try:
-            from core import ip_optimizer
-            from core.ip_optimizer import DOMAIN_GROUPS
-
-            domains = []
-            cfg = self.config_manager
-            for key, (_, group) in DOMAIN_GROUPS.items():
-                if cfg.proxy_accel_groups.get(key, key == "github"):
-                    domains.extend(group)
-            extra = [d.strip() for d in (cfg.proxy_extra_domains or []) if d.strip()]
-            domains.extend(extra)
-            if not domains:
-                logger.debug("自动优选跳过：未勾选任何目标域名")
-                return "ok"  # 视为完成，明天再说
-
-            results = ip_optimizer.optimize_domains(
-                domains, top_n=cfg.proxy_top_n)
-            usable = sum(1 for r in results if r["ips"])
-
-            # 更新缓存：update() 内部会先合并磁盘上的最新内容再原子落盘，
-            # 不会覆盖掉 UI 侧刚测出的结果
-            try:
-                from core.ip_optimizer import IpCache
-                cache = IpCache()
-                cache.update(results)
-            except Exception as e:
-                logger.debug(f"自动优选写入缓存失败: {e}")
-
-            msg = f"自动优选完成：{usable}/{len(results)} 个域名拿到可用 IP"
-            logger.info(msg)
-            self.notify(msg)
-            # 通知 UI 重新加载缓存并刷新表格，否则运行中的代理要到重启才用上新 IP
-            if self.on_ip_refreshed:
-                try:
-                    self.on_ip_refreshed()
-                except Exception as e:
-                    logger.debug(f"优选结果通知 UI 失败: {e}")
-            return "ok"
-        except Exception as e:
-            logger.error(f"自动优选失败: {e}")
-            return "fail"
-        finally:
-            self._work_lock.release()

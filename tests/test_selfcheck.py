@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""自检模块单测：报文解析、结果汇总、端口选择、provider 命名与节点过滤。"""
+"""自检模块单测：报文解析、结果汇总、端口选择。"""
 
 import os
 import socket
@@ -11,8 +11,6 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core import clash_kernel
-from core.clash_kernel import is_real_node, provider_name
 from core.selfcheck import (CheckItem, FAIL, OK, SKIP, format_report, free_port,
                            parse_a_records, summarize)
 
@@ -93,51 +91,3 @@ class TestFreePort(unittest.TestCase):
             holder.close()
 
 
-class TestProviderName(unittest.TestCase):
-    def test_ascii_name_kept(self):
-        self.assertEqual(provider_name("abc"), "sub_abc")
-
-    def test_chinese_name_is_hashed(self):
-        """中文名不能进 URL 路径，否则 http.client 用 ascii 编码报错。"""
-        name = provider_name("自检订阅")
-        self.assertTrue(name.isascii(), name)
-        self.assertTrue(name.startswith("sub_"))
-        self.assertNotEqual(provider_name("订阅甲"), provider_name("订阅乙"))
-
-    def test_illegal_chars_replaced(self):
-        name = provider_name("my sub/1")
-        self.assertTrue(name.isascii())
-        self.assertNotIn(" ", name)
-        self.assertNotIn("/", name)
-
-
-class TestIsRealNode(unittest.TestCase):
-    def test_group_types_excluded(self):
-        for t in ("selector", "urltest", "direct", "reject", "URLTest"):
-            self.assertFalse(is_real_node("节点选择", {"type": t}), t)
-        self.assertFalse(is_real_node("DIRECT", {}))
-
-    def test_info_placeholder_excluded(self):
-        for name in ("剩余流量：1005.44 GB", "套餐到期：长期有效", "官网：example.com",
-                     "距离下次重置剩余 12 天"):
-            self.assertFalse(is_real_node(name, {"type": "vless"}), name)
-
-    def test_real_nodes_kept(self):
-        self.assertTrue(is_real_node("🇯🇵日本东京01 | 移动联通推荐", {"type": "vless"}))
-        self.assertTrue(is_real_node("美国圣何塞-hy2", {"type": "hysteria2"}))
-
-
-class TestGeoSeedDirs(unittest.TestCase):
-    def test_returns_existing_dirs_only(self):
-        for path in clash_kernel.geo_seed_dirs(""):
-            self.assertTrue(os.path.isdir(path), path)
-
-    def test_kernel_dir_included(self):
-        kernel = os.path.join(os.environ.get("TEMP", "."), "mihomo.exe")
-        dirs = clash_kernel.geo_seed_dirs(kernel)
-        base = os.path.dirname(os.path.abspath(kernel))
-        self.assertIn(base, dirs) if os.path.isdir(base) else None
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -52,7 +52,6 @@ from utils import (
 from ui.process_io_priority_manager import show_process_io_priority_manager
 from ui.components.custom_titlebar import CustomTitleBar
 from ui.floating_window import create_floating_window
-from ui.accel_page import AccelPage
 from ui.pages import DiskCleanPage, StartupPage
 from ui.styles import (
     ColorScheme,
@@ -146,8 +145,6 @@ class MainWindow(QWidget):
     stop_progress_signal = Signal(int)
     stop_result_signal = Signal(str, int, int)
 
-    # 定时任务线程 → 主线程：优选结果落盘后刷新加速页缓存
-    ip_refreshed_signal = Signal()
     # 定时任务线程 → 主线程：完成提示走系统通知（winrt 对线程环境敏感，统一在主线程发）
     scheduled_notify_signal = Signal(str)
 
@@ -208,11 +205,9 @@ class MainWindow(QWidget):
         # 定时自动化任务巡检线程（每分钟看一次有没有到点；开关在设置页）
         from utils.scheduled_tasks import ScheduledTaskManager
         # 信号跨线程自动排队，定时任务线程 emit → 主线程槽执行
-        self.ip_refreshed_signal.connect(self._reload_accel_ip_cache)
         self.scheduled_notify_signal.connect(self._show_scheduled_notification)
-        self.scheduled_tasks = ScheduledTaskManager(
-            self.config_manager, notify=self._notify_scheduled,
-            on_ip_refreshed=self._on_scheduled_ip_refreshed)
+        self.scheduled_tasks = ScheduledTaskManager(self.config_manager,
+                                                    notify=self._notify_scheduled)
         self.scheduled_tasks.start()
 
         # 状态缓存：内容没变就不 setText（富文本 setText 每次都要重新解析排版，
@@ -744,22 +739,6 @@ class MainWindow(QWidget):
         auto_clean_row.addStretch()
         schedule_layout.addLayout(auto_clean_row)
 
-        self.auto_ip_checkbox = QCheckBox("每日自动重测优选 IP（GitHub / Steam，自动更新缓存）")
-        self.auto_ip_checkbox.setChecked(self.config_manager.schedule_auto_ip_enabled)
-        self.auto_ip_checkbox.stateChanged.connect(self.on_auto_ip_toggled)
-        schedule_layout.addWidget(self.auto_ip_checkbox)
-
-        auto_ip_row = QHBoxLayout()
-        auto_ip_row.addWidget(QLabel("每天触发时间:"))
-        self.auto_ip_hour_spin = QSpinBox()
-        self.auto_ip_hour_spin.setRange(0, 23)
-        self.auto_ip_hour_spin.setSuffix(" 点")
-        self.auto_ip_hour_spin.setValue(self.config_manager.schedule_auto_ip_hour)
-        self.auto_ip_hour_spin.valueChanged.connect(self.on_auto_ip_hour_changed)
-        auto_ip_row.addWidget(self.auto_ip_hour_spin)
-        auto_ip_row.addStretch()
-        schedule_layout.addLayout(auto_ip_row)
-
         schedule_info = QLabel(
             "💡 程序在后台运行时才会触发；任务在设定时间前后 1 分钟内自动执行\n"
             "💡 自动清理只碰浏览器/系统缓存等纯缓存目录，一律进回收站，可在统计中心查看记录"
@@ -909,9 +888,6 @@ class MainWindow(QWidget):
         self.startup_page = StartupPage()
         # DNS 过滤器选项卡（懒创建，服务不随程序自动启动；省 80ms 启动时间）
         self.dns_page = None
-        # 网络加速选项卡（代理 / 机场订阅 / GitHub-Steam 优选 IP）
-        # 注意：本页含「随程序自动启动代理」逻辑，必须随主窗口立即创建
-        self.accel_page = AccelPage(self.config_manager)
 
         # 懒创建注册表：占位页 -> (构造函数, 页签标题, 属性名)
         self._lazy_pages = {}
@@ -945,7 +921,6 @@ class MainWindow(QWidget):
         self.tabs.addTab(disk_placeholder, "  🧹 垃圾清理  ")
         self.tabs.addTab(self.startup_page, "  🚀 开机优化  ")
         self.tabs.addTab(dns_placeholder, "  🛡 DNS 过滤器  ")
-        self.tabs.addTab(self.accel_page, "  🚀 网络加速  ")
         self.tabs.addTab(stats_placeholder, "  📈 统计中心  ")
         self.tabs.addTab(settings_tab, "  设置  ")
 
@@ -2153,10 +2128,6 @@ class MainWindow(QWidget):
         if getattr(self, "dns_page", None) is not None:
             self.dns_page.shutdown()
 
-        # 停止本地代理并还原系统代理
-        if getattr(self, "accel_page", None) is not None:
-            self.accel_page.shutdown()
-
         # 停止定时自动化任务巡检线程
         if getattr(self, "scheduled_tasks", None) is not None:
             self.scheduled_tasks.stop()
@@ -2202,27 +2173,6 @@ class MainWindow(QWidget):
         if not self.config_manager.save_config():
             logger.warning("日志保留天数保存失败，本次修改仅在当前会话生效")
 
-    def _on_scheduled_ip_refreshed(self):
-        """定时优选写完盘：让加速页重新加载缓存（回调来自后台线程，切回主线程）。
-
-        注意不能在这里用 QTimer.singleShot —— 它只在调用线程的事件循环里计时，
-        后台线程没有事件循环，定时器永远不会触发（表现为"运行中的代理用不到新 IP"）。
-        """
-        try:
-            self.ip_refreshed_signal.emit()
-        except RuntimeError:
-            pass    # 窗口已销毁
-
-    def _reload_accel_ip_cache(self):
-        """主线程槽：加速页重新读盘并刷新表格。"""
-        page = getattr(self, "accel_page", None)
-        if page is None:
-            return
-        try:
-            page.reload_ip_cache()
-        except Exception as e:
-            logger.debug(f"刷新加速页优选缓存失败: {e}")
-
     def _notify_scheduled(self, message):
         """定时任务完成提示（回调来自后台线程 → 投递到主线程再发通知）。"""
         try:
@@ -2245,42 +2195,41 @@ class MainWindow(QWidget):
     def on_auto_clean_days_changed(self, value):
         self.config_manager.set_schedule_config(auto_clean_days=value)
 
-    def on_auto_ip_toggled(self, state):
-        self.config_manager.set_schedule_config(auto_ip_enabled=bool(state))
-
-    def on_auto_ip_hour_changed(self, value):
-        self.config_manager.set_schedule_config(auto_ip_hour=value)
-
     def _sample_usage_stats(self):
-        """采样 DNS/代理累计计数，把增量写入每日统计。
+        """采样 DNS 累计计数，把增量写入每日统计。
 
-        服务重启后计数器清零：当前值小于上次采样值时按 0 增量处理。
+        计数器复位（DNS 服务重启 / 页签重建）时当前值会小于上次采样值：
+        此时的增量是「复位后已累计的量」本身，不能再按 0 处理，否则
+        复位后到重新追上前次峰值之间的查询全部漏记。
         """
         try:
             from utils import stats_history
 
-            def _cum(page, attr_stats, names):
-                if page is None:
+            def _cum(obj, path, names):
+                """按点号路径逐级取属性（getattr 不解析点号，必须手动遍历）。"""
+                for part in path.split("."):
+                    if obj is None:
+                        break
+                    obj = getattr(obj, part, None)
+                if obj is None:
                     return {n: 0 for n in names}
-                stats = getattr(page, attr_stats)
-                return {n: int(getattr(stats, n, 0) or 0) for n in names}
+                return {n: int(getattr(obj, n, 0) or 0) for n in names}
 
             # DNS（dns_page 懒创建，未创建过说明用户没用过 DNS 页 → 0）
             dns = _cum(getattr(self, "dns_page", None), "filter.stats",
                        ("total", "blocked"))
-            # 代理：仅内置引擎有累计计数（mihomo 内核走 API 只有速率）
-            accel = getattr(self, "accel_page", None)
-            proxy = _cum(getattr(accel, "proxy", None), "stats",
-                         ("total", "up_bytes", "down_bytes"))
 
             last = self._usage_last
             delta = {}
-            cur = {"dns_queries": dns["total"], "dns_blocked": dns["blocked"],
-                   "proxy_total": proxy["total"],
-                   "proxy_up": proxy["up_bytes"], "proxy_down": proxy["down_bytes"]}
+            cur = {"dns_queries": dns["total"], "dns_blocked": dns["blocked"]}
             for key, val in cur.items():
                 prev = last.get(key)
-                delta[key] = val - prev if prev is not None and val >= prev else 0
+                if prev is None:
+                    delta[key] = 0            # 首次采样只建基线，不记账
+                elif val >= prev:
+                    delta[key] = val - prev
+                else:
+                    delta[key] = val          # 计数器复位：把已累计的量记上
             self._usage_last = cur
 
             stats_history.record_delta(**delta)
