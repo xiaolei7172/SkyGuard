@@ -400,7 +400,11 @@ class MemoryCleanerManager:
             return 0
 
     def get_system_cache_info(self):
-        """获取系统缓存信息"""
+        """获取系统缓存信息（内部 3 秒节流缓存：NtQuerySystemInformation
+        虽是轻量内核调用，但状态页/内存页每秒都取，无需每次都进内核）"""
+        now = time.time()
+        if now - getattr(self, "_cache_info_ts", 0.0) < 3.0:
+            return getattr(self, "_cache_info_val", None)
         try:
             info = SYSTEM_FILECACHE_INFORMATION()
             result_length = wintypes.ULONG(0)
@@ -410,13 +414,17 @@ class MemoryCleanerManager:
             )
 
             if status == 0:  # STATUS_SUCCESS
-                return {
+                result = {
                     "current_size": info.CurrentSize,
                     "peak_size": info.PeakSize,
                     "page_fault_count": info.PageFaultCount,
                 }
+            else:
+                result = None
 
-            return None
+            self._cache_info_ts = now
+            self._cache_info_val = result
+            return result
 
         except Exception as e:
             logger.error(f"获取系统缓存信息失败: {str(e)}")

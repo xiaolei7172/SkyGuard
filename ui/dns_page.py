@@ -820,11 +820,20 @@ class DnsPage(QWidget):
         if not checked:
             QMessageBox.information(self, "系统 DNS 接管", "请先在右侧勾选要接管的网卡。")
             return
-        done = []
-        for idx, name in checked:
-            ok, err = dns_takeover.take_over(idx)
-            if ok:
-                done.append(name)
+
+        # 每张网卡要串行调 2-3 次 PowerShell（单次超时 20-30s），必须放后台线程，
+        # 否则多网卡时界面会长时间无响应
+        def work():
+            done = []
+            for idx, name in checked:
+                ok, err = dns_takeover.take_over(idx)
+                if ok:
+                    done.append(name)
+            self._ui(lambda: self._after_takeover(done))
+
+        threading_run(work)
+
+    def _after_takeover(self, done):
         if done:
             QMessageBox.information(self, "系统 DNS 接管", "已把以下网卡的 DNS 指向本机：\n" + "、".join(done))
         else:
@@ -858,7 +867,7 @@ class DnsPage(QWidget):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         # 先恢复 DNS 再停服务，避免系统 DNS 指向已停止的本机端口
-        if dns_takeover._load_backup():
+        if dns_takeover.has_backup():
             restored, _err = dns_takeover.restore_all()
             if restored:
                 logger.info(f"停止 DNS 服务前已恢复系统 DNS: {restored}")
@@ -1410,7 +1419,7 @@ class DnsPage(QWidget):
         # 状态没变化就整体跳过：下面全是 setText/setStyleSheet，
         # 每次都会触发重排版，是 DNS 页每 2 秒卡一下的主因
         dns_state = "未接管"
-        if sel and dns_takeover._load_backup():
+        if sel and dns_takeover.has_backup():
             dns_state = "已接管"
         sig = (running, self.filter.port, tuple(self.filter.bind_errors),
                sel.name if sel else None,
@@ -1460,7 +1469,7 @@ class DnsPage(QWidget):
             self.easy_meta.setText(
                 f"当前上游：{sel.name + '（' + sel.proto + '）' if sel else '未配置上游'} · "
                 f"广告规则 {rules.count} 条 · 重写 {len(self.filter.rewrites)} 条"
-                + (f" · 系统 DNS 已接管" if dns_takeover._load_backup() else ""))
+                + (f" · 系统 DNS 已接管" if dns_takeover.has_backup() else ""))
         else:
             self.easy_meta.setText("")
         self.easy_meta.setVisible(bool(self.easy_meta.text()))
@@ -1475,7 +1484,7 @@ class DnsPage(QWidget):
     def shutdown(self):
         """主窗口退出时调用：恢复系统 DNS 并停止服务。"""
         try:
-            if dns_takeover._load_backup():
+            if dns_takeover.has_backup():
                 dns_takeover.restore_all()
         except Exception as e:
             logger.warning(f"退出时恢复系统 DNS 失败: {e}")

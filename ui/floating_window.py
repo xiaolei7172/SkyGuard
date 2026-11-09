@@ -278,7 +278,10 @@ class FloatingWindow(QWidget):
         _, _, value_label = self._rows[key]
         value_label.setText(text)
         if color is not None:
-            value_label.setStyleSheet(f"color: {color};")
+            # 颜色没变就跳过 setStyleSheet（重排版开销远大于一次属性比较）
+            if getattr(value_label, "_last_color", None) != color:
+                value_label._last_color = color
+                value_label.setStyleSheet(f"color: {color};")
 
     @staticmethod
     def _level_color(value, colors):

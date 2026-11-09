@@ -406,13 +406,24 @@ class ProcessIoPriorityManager:
         """
         success_count = 0
         total_count = 0
-        
+
         try:
-            # 查找所有匹配的进程
-            for proc in psutil.process_iter(['pid', 'name']):
-                if proc.info['name'].lower() == process_name.lower():
+            # 短 TTL 进程快照：一键优化会连续按名设置 5 个进程，
+            # 每次都全量 process_iter（3-7ms×5）纯属浪费，2 秒内复用一份枚举
+            now = time.time()
+            snapshot = getattr(self, "_proc_snapshot", None)
+            if snapshot is None or now - snapshot[0] > 2.0:
+                procs = [(p.info["pid"], (p.info["name"] or "").lower())
+                         for p in psutil.process_iter(["pid", "name"])]
+                self._proc_snapshot = (now, procs)
+            else:
+                procs = snapshot[1]
+
+            name_lower = process_name.lower()
+            for pid, pname in procs:
+                if pname == name_lower:
                     total_count += 1
-                    if self.set_process_io_priority(proc.info['pid'], priority, performance_mode):
+                    if self.set_process_io_priority(pid, priority, performance_mode):
                         success_count += 1
             
             if total_count == 0:
@@ -435,7 +446,9 @@ class ProcessIoPriorityManager:
                 'pid': proc.pid,
                 'name': proc.name(),
                 'create_time': proc.create_time(),
-                'cpu_percent': proc.cpu_percent(interval=0.1),
+                # interval=None 非阻塞：interval=0.1 会同步卡 100ms，
+                # CPU 占用率让调用方按需两次采样计算
+                'cpu_percent': proc.cpu_percent(interval=None),
                 'memory_percent': proc.memory_percent(),
                 'status': proc.status()
             }

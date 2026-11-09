@@ -66,6 +66,73 @@ from ui.styles import (
 )
 
 
+def _locate_ace_uninstaller():
+    """定位 ACE 反作弊卸载器。
+
+    优先从注册表 Uninstall 项的 InstallLocation 解析真实安装目录
+    （兼容 x86 / 自定义安装路径），失败时回退到常见默认路径。
+    """
+    candidates = []
+    try:
+        import winreg
+
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    key = winreg.OpenKey(
+                        hive,
+                        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                        0, winreg.KEY_READ | view,
+                    )
+                except OSError:
+                    continue
+                try:
+                    i = 0
+                    while True:
+                        try:
+                            subkey_name = winreg.EnumKey(key, i)
+                            i += 1
+                        except OSError:
+                            break
+                        try:
+                            sub = winreg.OpenKey(key, subkey_name)
+                        except OSError:
+                            continue
+                        try:
+                            display = ""
+                            try:
+                                display = (winreg.QueryValueEx(sub, "DisplayName")[0] or "")
+                            except OSError:
+                                pass
+                            if "anticheat" not in display.lower() and "ace" not in display.lower():
+                                continue
+                            try:
+                                loc = winreg.QueryValueEx(sub, "InstallLocation")[0]
+                            except OSError:
+                                loc = ""
+                            if loc:
+                                candidates.append(
+                                    os.path.join(loc, "Uninstaller.exe"))
+                        finally:
+                            winreg.CloseKey(sub)
+                finally:
+                    winreg.CloseKey(key)
+    except Exception as e:
+        logger.debug(f"从注册表定位 ACE 卸载器失败: {e}")
+
+    candidates.extend([
+        r"C:\Program Files\AntiCheatExpert\Uninstaller.exe",
+        r"C:\Program Files (x86)\AntiCheatExpert\Uninstaller.exe",
+    ])
+    for c in candidates:
+        try:
+            if c and os.path.isfile(c):
+                return c
+        except OSError:
+            continue
+    return None
+
+
 class MainWindow(QWidget):
     """主窗口"""
 
@@ -1240,10 +1307,11 @@ class MainWindow(QWidget):
 
         html.append("</div>")
 
-        # 添加更新时间
+        # 添加更新时间（分钟级：秒级时间戳会让每秒 HTML 签名都不同，
+        # 导致"内容没变就跳过 setText"的缓存永远失效）
         import datetime
 
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         html.append(f'<p class="update-time">更新时间: {current_time}</p>')
 
         return "".join(html)
@@ -1751,7 +1819,8 @@ class MainWindow(QWidget):
                 self.download_url = update_info.get("download_url")
                 if not self.download_url:
                     self.download_url = update_info.get("url", self.github_releases_url)
-            except:
+            except (ValueError, TypeError) as e:
+                logger.debug(f"解析更新信息失败，使用默认发布页: {e}")
                 self.download_url = self.github_releases_url
 
         # 更新版本显示标签
@@ -2248,7 +2317,7 @@ class MainWindow(QWidget):
         self.delete_progress_dialog.show()
 
         # 使用线程执行删除操作
-        threading.Thread(target=self._delete_services_thread, args=(services, self.delete_progress_dialog)).start()
+        threading.Thread(target=self._delete_services_thread, args=(services, self.delete_progress_dialog), daemon=True).start()
 
     def _delete_services_thread(self, services, progress):
         """线程函数：删除服务"""
@@ -2279,8 +2348,9 @@ class MainWindow(QWidget):
                     capture_output=True, text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW, check=False,
                 )
-                # 等待操作完成
+                # 等待操作完成后失效缓存再校验，避免读到操作前的状态
                 time.sleep(2)
+                self.monitor.invalidate_service_cache(service)
 
                 # 校验服务是否已删除
                 exists, _, _ = self.monitor.check_service_status(service)
@@ -2452,8 +2522,11 @@ class MainWindow(QWidget):
         # 导入对话框类
         from ui.process_io_priority_manager import ProcessIoPriorityManagerWidget
 
-        # 创建对话框
-        widget = ProcessIoPriorityManagerWidget(self, self.monitor.config_manager)
+        # 单例复用：重复 new 会导致 Widget（含 QTimer + 线程）泄漏
+        widget = getattr(self, "_io_priority_widget", None)
+        if widget is None:
+            widget = ProcessIoPriorityManagerWidget(self, self.monitor.config_manager)
+            self._io_priority_widget = widget
 
         # 获取选项卡控件并切换到自动优化列表页面（索引1）
         tab_widget = widget.findChild(QTabWidget)
@@ -2502,7 +2575,7 @@ class MainWindow(QWidget):
         self.stop_progress_dialog.show()
 
         # 使用线程执行停止操作
-        threading.Thread(target=self._stop_services_thread, args=(services, self.stop_progress_dialog)).start()
+        threading.Thread(target=self._stop_services_thread, args=(services, self.stop_progress_dialog), daemon=True).start()
 
     def _stop_services_thread(self, services, progress):
         """线程函数：停止服务"""
@@ -2533,8 +2606,9 @@ class MainWindow(QWidget):
                     capture_output=True, text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW, check=False,
                 )
-                # 等待操作完成
+                # 等待操作完成后失效缓存再校验，避免读到操作前的状态
                 time.sleep(2)
+                self.monitor.invalidate_service_cache(service)
 
                 # 校验服务是否已停止
                 exists, new_status, _ = self.monitor.check_service_status(service)
@@ -2631,9 +2705,10 @@ class MainWindow(QWidget):
             return
 
         try:
-            # 检查卸载程序是否存在
-            uninstaller_path = "C:\\Program Files\\AntiCheatExpert\\Uninstaller.exe"
-            if not os.path.exists(uninstaller_path):
+            # 检查卸载程序是否存在（优先从注册表 Uninstall 项解析真实安装目录，
+            # 硬编码路径在 x86 安装或自定义目录时会失效）
+            uninstaller_path = _locate_ace_uninstaller()
+            if not uninstaller_path:
                 QMessageBox.warning(self, "卸载失败", "未找到ACE反作弊卸载程序，请确认已安装ACE反作弊。\n")
                 return
 

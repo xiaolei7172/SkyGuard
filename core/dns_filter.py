@@ -130,17 +130,33 @@ class Upstream:
 
     def _query_dot(self, wire_query, timeout):
         host, port = self._host_port(853)
+        is_ip = host.replace(".", "").isdigit()
+        if is_ip:
+            # IP 直连先尝试完整证书校验：主流公共 DoT（阿里 223.5.5.5 等）
+            # 证书都带 IP SAN，能直接通过；只有不含 IP SAN 的服务商才降级
+            try:
+                ctx = ssl.create_default_context()
+                with socket.create_connection((host, port), timeout=timeout) as raw:
+                    with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                        return self._dot_exchange(tls, wire_query, timeout)
+            except ssl.SSLCertVerificationError as e:
+                logger.debug(f"DoT 证书 IP 校验失败（{host}），降级为不校验域名: {e}")
+        # 域名模式 或 IP 降级路径：仅加密传输
+        # （IP 直连无法校验证书域名，是 DoT over IP 的固有限制）
         ctx = ssl.create_default_context()
-        # DoT 常用 IP 直连（如 223.5.5.5），此时无法校验证书域名
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         with socket.create_connection((host, port), timeout=timeout) as raw:
-            with ctx.wrap_socket(raw, server_hostname=host if not host.replace(".", "").isdigit() else None) as tls:
-                tls.settimeout(timeout)
-                tls.sendall(struct.pack(">H", len(wire_query)) + wire_query)
-                hdr = self._recv_exact(tls, 2)
-                (length,) = struct.unpack(">H", hdr)
-                return self._recv_exact(tls, length)
+            with ctx.wrap_socket(raw, server_hostname=None if is_ip else host) as tls:
+                return self._dot_exchange(tls, wire_query, timeout)
+
+    def _dot_exchange(self, tls, wire_query, timeout):
+        """在已建立的 TLS 连接上完成一次 DNS 查询收发。"""
+        tls.settimeout(timeout)
+        tls.sendall(struct.pack(">H", len(wire_query)) + wire_query)
+        hdr = self._recv_exact(tls, 2)
+        (length,) = struct.unpack(">H", hdr)
+        return self._recv_exact(tls, length)
 
     def _query_doh(self, wire_query, timeout):
         with self._lock:

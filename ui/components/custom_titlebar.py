@@ -119,8 +119,8 @@ class CustomTitleBar(QWidget):
         if hasattr(self.parent_widget, "_original_paintEvent"):
             try:
                 self.parent_widget._original_paintEvent(event)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"父窗口原始 paintEvent 调用失败: {e}")
 
         # 绘制圆角窗口背景
         painter = QPainter(self.parent_widget)
@@ -146,8 +146,8 @@ class CustomTitleBar(QWidget):
         if hasattr(self.parent_widget, "_original_showEvent"):
             try:
                 self.parent_widget._original_showEvent(event)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"父窗口原始 showEvent 调用失败: {e}")
 
         # 应用圆角遮罩
         self.apply_rounded_mask()
@@ -161,8 +161,8 @@ class CustomTitleBar(QWidget):
         if hasattr(self.parent_widget, "_original_resizeEvent"):
             try:
                 self.parent_widget._original_resizeEvent(event)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"父窗口原始 resizeEvent 调用失败: {e}")
 
         # 延迟应用遮罩以确保窗口完全调整大小后再应用
         QTimer.singleShot(10, self.apply_rounded_mask)

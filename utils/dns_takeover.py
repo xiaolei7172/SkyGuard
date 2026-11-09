@@ -22,12 +22,16 @@ LOCAL_DNS = ["127.0.0.1", "::1"]
 
 
 def _run_ps(script, timeout=30):
-    """执行一段 PowerShell，返回 (stdout, error)。统一 UTF-8 输出。"""
+    """执行一段 PowerShell，返回 (stdout, error)。统一 UTF-8 输出。
+
+    CREATE_NO_WINDOW：GUI 程序里每次调 PowerShell 都不能闪黑框。
+    """
     script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + script
     cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=timeout, encoding="utf-8", errors="replace")
+                                timeout=timeout, encoding="utf-8", errors="replace",
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if result.returncode != 0:
             return "", (result.stderr or "").strip() or f"exit {result.returncode}"
         return result.stdout, None
@@ -161,6 +165,24 @@ def _load_backup():
     except Exception as e:
         logger.warning(f"读取 DNS 备份失败: {e}")
     return {}
+
+
+def has_backup():
+    """是否存在 DNS 备份（供 UI 周期轮询用）。
+
+    UI 每 2s 会查一次接管状态，直接 _load_backup() 会反复读盘解析 JSON；
+    这里基于文件 mtime 做轻缓存，文件变了才重新解析。
+    """
+    try:
+        mtime = os.path.getmtime(BACKUP_FILE)
+    except OSError:
+        return False
+    cache = getattr(has_backup, "_cache", None)
+    if cache is not None and cache[0] == mtime:
+        return cache[1]
+    value = bool(_load_backup())
+    has_backup._cache = (mtime, value)
+    return value
 
 
 def _save_backup(backup):

@@ -189,9 +189,18 @@ class StartupManager:
         items = []
         try:
             import win32com.client
+            import pythoncom
         except ImportError:
             logger.debug("未安装 pywin32，跳过计划任务枚举")
             return items
+        # 本函数常在工作线程里调用：COM 必须先按线程初始化，
+        # 否则 Dispatch 会整段抛错并被吞成"空列表"
+        co_init = False
+        try:
+            pythoncom.CoInitialize()
+            co_init = True
+        except Exception:
+            pass
         try:
             sched = win32com.client.Dispatch("Schedule.Service")
             sched.Connect()
@@ -233,6 +242,12 @@ class StartupManager:
                     continue
         except Exception as e:
             logger.debug(f"计划任务枚举失败：{e}")
+        finally:
+            if co_init:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
         return items
 
     def _enum_services(self):
@@ -457,7 +472,24 @@ class StartupManager:
                                 winreg.DeleteValue(k, name)
                             except OSError:
                                 pass
+
+                    def _value_differs(name, v):
+                        """当前注册表值与快照不一致（或不存在）时才需要写入。"""
+                        try:
+                            cur_t, cur_data, _ = winreg.QueryValueEx(k, name)
+                        except OSError:
+                            return True
+                        if cur_t != v["type"]:
+                            return True
+                        if v["type"] == winreg.REG_BINARY:
+                            return cur_data != bytes.fromhex(v["data"])
+                        return cur_data != v["data"]
+
                     for name, v in values.items():
+                        # 只回写有差异的值：对 HKLM\...\Run / StartupApproved
+                        # 做无差别批量写入是杀软"批量自启动键修改"启发式的典型特征
+                        if not _value_differs(name, v):
+                            continue
                         if v["type"] == winreg.REG_BINARY:
                             winreg.SetValueEx(k, name, 0, v["type"], bytes.fromhex(v["data"]))
                         else:

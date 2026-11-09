@@ -168,11 +168,15 @@ class GameProcessMonitor:
                          'stop_pending', 'continue_pending', 'pause_pending', 'unknown'
                 启动类型: 'auto', 'manual', 'disabled', 'unknown'
         """
-        # 检查服务缓存，如果服务之前检查过不存在，减少重复检查频率
+        # 检查服务缓存，减少重复 SCM 往返：
+        # - 不存在的服务：10 分钟内直接用缓存（反作弊服务通常不装）
+        # - 存在的服务：8 秒内直接用缓存（状态页每秒刷新，无需每秒都查 SCM）
         if hasattr(self, "_service_cache") and service_name in self._service_cache:
             cache_item = self._service_cache[service_name]
-            # 如果服务不存在，且上次检查时间在10分钟内，直接返回缓存结果
-            if not cache_item["exists"] and time.time() - cache_item["last_check"] < 600:
+            age = time.time() - cache_item["last_check"]
+            if not cache_item["exists"] and age < 600:
+                return cache_item["exists"], cache_item["status"], cache_item["start_type"]
+            if cache_item["exists"] and age < 8.0:
                 return cache_item["exists"], cache_item["status"], cache_item["start_type"]
 
         try:
@@ -237,7 +241,7 @@ class GameProcessMonitor:
                         error_code = e.winerror
                     elif isinstance(e, tuple) and len(e) > 0:
                         error_code = e[0]
-                except:
+                except Exception:
                     error_code = None
 
                 # 服务不存在时不记录警告日志，只在初次检查或错误码不是1060时记录
@@ -270,6 +274,21 @@ class GameProcessMonitor:
             logger.error(f"检查服务状态时发生错误: [{error_type}] {error_msg}")
             logger.debug(f"服务名称: {service_name}, 异常详情: {repr(e)}")
             return False, "unknown", "unknown"
+
+    def invalidate_service_cache(self, service_name=None):
+        """使服务状态缓存失效。
+
+        Args:
+            service_name: 指定服务名则只失效该服务；None 则全部失效。
+                          在 sc stop / sc delete 等改变服务状态的操作后调用，
+                          避免校验读到过期缓存。
+        """
+        if not hasattr(self, "_service_cache"):
+            return
+        if service_name is None:
+            self._service_cache.clear()
+        else:
+            self._service_cache.pop(service_name, None)
 
     def monitor_anticheat_service(self):
         """
@@ -419,7 +438,9 @@ class GameProcessMonitor:
         Returns:
             tuple: (是否运行, 是否已优化)
         """
-        proc = self.is_process_running(process_name)
+        # 状态页每秒调用：默认读监控线程维护的进程缓存（stale_ok=True），
+        # 避免 SGuard64 不存在时每秒做一次全量 psutil 枚举（3-7ms）。
+        proc = self.is_process_running(process_name, stale_ok=True)
         if not proc:
             return False, False
 

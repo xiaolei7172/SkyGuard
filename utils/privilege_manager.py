@@ -70,9 +70,10 @@ class WindowsPrivilegeManager:
             ]
 
             # 3. 进程管理权限 - 进程优先级设置必需
+            # （不再请求 SeSystemtimePrivilege：全项目没有改系统时间的功能，
+            #   启动即持有无用高危特权会扩大攻击面、加重杀软启发式扣分）
             process_privileges = [
                 "SeIncreaseBasePriorityPrivilege",  # 提升进程基础优先级权限
-                "SeSystemtimePrivilege",  # 系统时间权限
                 # "SeAssignPrimaryTokenPrivilege",           # 分配主令牌权限
             ]
 

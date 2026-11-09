@@ -5,21 +5,39 @@
 通知系统模块
 """
 
-import winrt
-import winrt.windows.foundation
-import winrt.windows.foundation.collections
-
 import os
 import sys
 import queue
 import threading
 import time
 from .logger import logger
-from windows_toasts import (
-    InteractableWindowsToaster, Toast, WindowsToaster, 
-    ToastImagePosition, ToastButton, ToastDisplayImage, ToastAudio
-)
 from config.app_config import APP_INFO
+
+# 说明：不在此处顶层导入 winrt / windows_toasts —— 它们体量大且只在真正
+# 发通知时才需要，顶层导入会拖慢每次启动（winrt 在本模块中从未使用）。
+# 通过 _load_wt() 首次使用时导入，并暴露 PEP 562 __getattr__ 便于测试 mock。
+
+_WT_NAMES = ("InteractableWindowsToaster", "Toast", "ToastImagePosition",
+             "ToastButton", "ToastDisplayImage", "ToastAudio")
+_WT_LOADED = False
+
+
+def _load_wt():
+    """首次调用时导入 windows_toasts 并挂到模块级名字。已加载则直接返回。"""
+    global _WT_LOADED
+    if _WT_LOADED:
+        return
+    import windows_toasts as _wt
+    for _n in _WT_NAMES:
+        globals()[_n] = getattr(_wt, _n)
+    _WT_LOADED = True
+
+
+def __getattr__(name):
+    if name in _WT_NAMES:
+        _load_wt()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # 全局通知对象
@@ -35,6 +53,7 @@ def get_toaster():
     """
     global _toaster
     if _toaster is None:
+        _load_wt()
         _toaster = InteractableWindowsToaster('')
     return _toaster
 
@@ -51,8 +70,11 @@ def send_notification(title, message, icon_path=None, buttons=None, silent=True)
         silent (bool, optional): 是否静音通知
     """
     try:
+        # 懒加载：首次发通知才导入 windows_toasts（导入失败会走下面的容错分支）
+        _load_wt()
+
         toaster = get_toaster()
-        
+
         # 根据silent参数设置音频
         audio = ToastAudio(silent=True) if silent else ToastAudio()
         

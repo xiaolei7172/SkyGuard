@@ -1050,18 +1050,36 @@ class AccelPage(QWidget):
 
         self._run(work, done, failed)
 
-    def _start_clash(self, port, host):
-        """用 mihomo 内核启动代理。成功返回 True。"""
+    def _start_clash(self, port, host, on_done):
+        """用 mihomo 内核启动代理。
+
+        kernel.start() 最长可同步阻塞 15 秒（轮询 API 就绪），必须放后台线程，
+        结果经 on_done(bool) 回到主线程，避免点击启动后界面白屏。
+        """
         kernel_path = clash_kernel.find_kernel(
             getattr(self.config_manager, "proxy_kernel_path", ""))
         if not kernel_path:
             QMessageBox.warning(self, "Clash 内核",
                                 "未找到 mihomo 内核，请先点击「下载内核」。\n"
                                 "内核原生支持 hysteria2 / vless 等全部协议。")
-            return False
-        if self.kernel is not None:
-            self.kernel.stop()
-        try:
+            on_done(False)
+            return
+
+        # 防重入 + 代次令牌：启动期间点停止/再启动时，旧结果作废并回收新内核
+        if getattr(self, "_kernel_starting", False):
+            return
+        self._kernel_starting = True
+        self._kernel_gen = getattr(self, "_kernel_gen", 0) + 1
+        gen = self._kernel_gen
+        old_kernel = self.kernel
+        selected_node = self.selected_kernel_node
+
+        def work():
+            if old_kernel is not None:
+                try:
+                    old_kernel.stop()
+                except Exception as e:
+                    logger.debug(f"停止旧内核失败: {e}")
             kernel = MihomoKernel(
                 kernel_path,
                 os.path.join(os.path.expanduser("~"), ".skyguard", "clash"),
@@ -1086,19 +1104,37 @@ class AccelPage(QWidget):
                 ads_payload=self._ads_payload() if self.config_manager.dns_enabled else None,
                 accel_domains=accel_domains)
             kernel.start(config)
-        except (KernelNotFound, RuntimeError) as e:
-            QMessageBox.critical(self, "代理服务", f"Clash 内核启动失败：\n{e}")
+            return kernel
+
+        def done(kernel):
+            self._kernel_starting = False
+            if gen != self._kernel_gen:
+                # 启动过程中用户已停止/再次启动，回收这次起的内核
+                try:
+                    kernel.stop()
+                except Exception as e:
+                    logger.debug(f"回收过期内核失败: {e}")
+                return
+            self.kernel = kernel
+            if selected_node:
+                try:
+                    kernel.select_proxy(selected_node)
+                except OSError as e:
+                    logger.debug(f"恢复选中节点失败: {e}")
+            on_done(True)
+
+        def failed(err):
+            self._kernel_starting = False
             self._style_pill(False)
-            return False
-        self.kernel = kernel
-        if self.selected_kernel_node:
-            try:
-                kernel.select_proxy(self.selected_kernel_node)
-            except OSError as e:
-                logger.debug(f"恢复选中节点失败: {e}")
-        return True
+            QMessageBox.critical(self, "代理服务", f"Clash 内核启动失败：\n{err}")
+            on_done(False)
+
+        self._run(work, done, failed)
 
     def _stop_kernel(self):
+        # 代次 +1：使任何进行中的后台启动回调作废
+        self._kernel_gen = getattr(self, "_kernel_gen", 0) + 1
+        self._kernel_starting = False
         if self.kernel is not None:
             try:
                 self.kernel.stop()
@@ -1162,8 +1198,9 @@ class AccelPage(QWidget):
         if self._engine() == "clash":
             self.proxy.stop()          # 内核模式下内置引擎保持停止
             self.proxy.port = port     # 供系统代理判断使用
-            if not self._start_clash(port, host):
-                return
+            # 内核启动放后台线程（最长 15s），完成后回主线程走收尾
+            self._start_clash(port, host, self._after_proxy_started)
+            return
         else:
             self._stop_kernel()
             if self.proxy.running and (self.proxy.port != port or self.proxy.host != host):
@@ -1179,7 +1216,10 @@ class AccelPage(QWidget):
                                                                             ["端口被占用，换个端口试试"]))
                 self._style_pill(False)
                 return
+        self._after_proxy_started(port)
 
+    def _after_proxy_started(self, port):
+        """代理启动成功后的统一收尾（主线程）。"""
         self._style_pill(True)
         self.status_changed.emit(True)
         self.refresh_node_table()
@@ -1291,15 +1331,40 @@ class AccelPage(QWidget):
                 self.conn_table.setItem(r, c, cell)
 
     def _refresh_stats_kernel(self):
-        """mihomo 内核模式：统计与连接列表来自 RESTful API。"""
-        if not (self.kernel is not None and self.kernel.running):
+        """mihomo 内核模式：统计与连接列表来自 RESTful API。
+
+        HTTP 拉取放后台线程（单次超时最长 6s，主线程同步调会让界面周期性卡顿），
+        数据回主线程后再更新控件。
+        """
+        kernel = self.kernel
+        if not (kernel is not None and kernel.running):
             return
-        try:
-            info = self.kernel.traffic()
-            conns = self.kernel.recent_connections(limit=60)
-        except OSError as e:
-            logger.debug(f"读取内核状态失败: {e}")
+        # 上一轮还没回来就先跳过，防止请求堆积
+        if getattr(self, "_stats_fetching", False):
             return
+        self._stats_fetching = True
+
+        def work():
+            info = kernel.traffic()
+            conns = kernel.recent_connections(limit=60)
+            return info, conns
+
+        def done(result):
+            self._stats_fetching = False
+            # 拉取期间内核已停止/更换则丢弃
+            if self.kernel is not kernel:
+                return
+            info, conns = result
+            self._apply_kernel_stats(info, conns)
+
+        def failed(err):
+            self._stats_fetching = False
+            logger.debug(f"读取内核状态失败: {err}")
+
+        self._run(work, done, failed)
+
+    def _apply_kernel_stats(self, info, conns):
+        """把内核统计数据落到界面控件（主线程）。"""
         self.stat_cards["total"].setText(str(info["active"]))
         proxied = sum(1 for c in conns
                       if c["node"] not in ("DIRECT", "REJECT", ""))

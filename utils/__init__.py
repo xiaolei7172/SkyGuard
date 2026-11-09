@@ -4,7 +4,8 @@
 """工具类模块"""
 
 from utils.logger import setup_logger, logger
-from utils.notification import send_notification, notification_thread
+# 通知模块懒加载：utils.notification 顶层不再携带 winrt/windows_toasts，
+# 且本 __init__ 也不顶层 re-export，首次访问时才导入（PEP 562 __getattr__）
 from utils.version_checker import (
     check_for_update,
     get_app_version,
@@ -33,7 +34,14 @@ from utils.clean_engine import get_clean_engine, format_size
 from utils.startup_manager import get_startup_manager
 from utils.clean_rules import get_rules as get_clean_rules
 
-from utils.notification import find_icon_path, create_notification_thread
+
+def __getattr__(name):
+    """PEP 562：通知相关符号在首次访问时才导入，缩短启动导入链。"""
+    if name in ("send_notification", "notification_thread",
+                "find_icon_path", "create_notification_thread"):
+        from utils import notification as _notification
+        return getattr(_notification, name)
+    raise AttributeError(f"module 'utils' has no attribute {name!r}")
 
 
 __all__ = [

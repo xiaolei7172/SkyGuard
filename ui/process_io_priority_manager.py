@@ -70,7 +70,7 @@ class ProcessInfoWorker(QThread):
                     try:
                         memory_info = proc.memory_info()
                         proc_info["memory_mb"] = memory_info.rss / (1024 * 1024)
-                    except:
+                    except (psutil.Error, OSError):
                         proc_info["memory_mb"] = 0
 
                     # 处理用户名
@@ -571,7 +571,7 @@ class ProcessIoPriorityManagerWidget(QWidget):
         time_item = self._get_or_create_item(row, 5)
         try:
             create_time = time.strftime("%m-%d %H:%M", time.localtime(proc.get("create_time", 0)))
-        except:
+        except (TypeError, ValueError, OSError):
             create_time = "N/A"
         time_item.setText(create_time)
 
@@ -1093,13 +1093,17 @@ class ProcessIoPriorityManagerWidget(QWidget):
         # 断开主题信号连接
         try:
             theme_manager.theme_changed.disconnect(self.apply_theme_properties)
-        except:
-            pass  # 忽略断开连接失败的情况
+        except (RuntimeError, TypeError):
+            pass  # 信号未连接时断开会抛 RuntimeError，忽略即可
 
         event.accept()
 
 
 def show_process_io_priority_manager(parent=None, config_manager=None):
-    """显示进程I/O优先级管理对话框"""
-    widget = ProcessIoPriorityManagerWidget(parent, config_manager)
+    """显示进程I/O优先级管理对话框（父窗口持有单例，避免重复创建泄漏）"""
+    widget = getattr(parent, "_io_priority_widget", None) if parent is not None else None
+    if widget is None:
+        widget = ProcessIoPriorityManagerWidget(parent, config_manager)
+        if parent is not None:
+            parent._io_priority_widget = widget
     return widget.show()

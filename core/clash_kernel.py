@@ -184,13 +184,27 @@ def download_kernel(dest_dir=None, progress=None):
     zip_path = os.path.join(dest_dir, "mihomo_download.zip")
     last = [0]
 
-    def report(count, block, total):
-        done = count * block
-        if total > 0 and progress and done - last[0] > total // 20:
-            last[0] = done
-            progress(f"下载 {asset['name']} … {min(100, done * 100 // total)}%")
-
-    urllib.request.urlretrieve(url, zip_path, reporthook=report)
+    # urlretrieve 没有超时参数，网络卡住会永久挂起；改用 urlopen 分块下载
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", "SkyGuard")
+    total = int(asset.get("size", 0) or 0)
+    with opener.open(req, timeout=60) as resp, open(zip_path, "wb") as fh:
+        fetched = 0
+        while True:
+            chunk = resp.read(256 * 1024)
+            if not chunk:
+                break
+            fh.write(chunk)
+            fetched += len(chunk)
+            if progress and total > 0 and fetched // (total // 20) != \
+                    (fetched - len(chunk)) // (total // 20):
+                progress(f"下载 {asset['name']} … {min(100, fetched * 100 // total)}%")
+    if total and fetched != total:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        raise KernelNotFound(f"内核下载不完整（{fetched}/{total} 字节），已放弃安装")
 
     if progress:
         progress("解压内核 …")
@@ -202,6 +216,11 @@ def download_kernel(dest_dir=None, progress=None):
                 break
         if exe_name is None:
             raise KernelNotFound("压缩包里没有找到内核可执行文件")
+        # 防路径穿越：解压目标必须在 dest_dir 内（zip-slip 防护）
+        if os.path.basename(exe_name) != exe_name and not exe_name.endswith("/"):
+            safe_rel = os.path.normpath(exe_name).lstrip("/\\")
+            if safe_rel.startswith("..") or ".." in safe_rel.split(os.sep):
+                raise KernelNotFound(f"压缩包内路径异常（{exe_name}），已拒绝解压")
         z.extract(exe_name, dest_dir)
     os.remove(zip_path)
 

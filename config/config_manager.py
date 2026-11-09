@@ -8,12 +8,29 @@
 import os
 import yaml
 from utils.logger import logger
-from utils.system_utils import check_auto_start, enable_auto_start, disable_auto_start
 from config.app_config import APP_INFO, DEFAULT_CONFIG, SYSTEM_CONFIG
+
+# 注意：check_auto_start / enable_auto_start / disable_auto_start 不在此顶层导入。
+# utils.system_utils 也依赖 config.app_config，顶层互相导入会形成
+# utils.system_utils ↔ config.config_manager 循环（懒加载场景下会触发 ImportError），
+# 统一在使用处函数内导入。
 
 
 class ConfigManager:
-    """配置管理类"""
+    """配置管理类
+
+    全局单例：main.py 首次创建（带自定义参数），后续任何 ConfigManager()
+    都复用同一实例。多实例各持一份配置快照会在 save_config 时互相覆盖
+    （例如改主题被内存清理器的旧快照回滚），因此收敛为单例。
+    """
+
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, custom_app_info=None, custom_default_config=None, custom_system_config=None):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
     def __init__(self, custom_app_info=None, custom_default_config=None, custom_system_config=None):
         """
@@ -24,6 +41,9 @@ class ConfigManager:
             custom_default_config (dict, optional): 自定义默认配置，用于覆盖默认值
             custom_system_config (dict, optional): 自定义系统配置，用于覆盖默认值
         """
+        if self._initialized:
+            return
+
         # 合并配置
         self.app_info = APP_INFO.copy()
         if custom_app_info:
@@ -85,6 +105,8 @@ class ConfigManager:
 
         # 加载配置文件
         self.load_config()
+
+        ConfigManager._initialized = True
 
     def _deep_update(self, d, u):
         """
@@ -153,6 +175,10 @@ class ConfigManager:
 
                 # 读取应用设置
                 if "application" in config_data:
+                    # 函数内导入，避免 utils.system_utils ↔ 本模块循环导入
+                    from utils.system_utils import (
+                        check_auto_start, enable_auto_start, disable_auto_start,
+                    )
                     if "auto_start" in config_data["application"]:
                         self.auto_start = bool(config_data["application"]["auto_start"])
                         # 检查实际开机自启状态与配置是否一致
@@ -162,10 +188,12 @@ class ConfigManager:
                                 f"开机自启配置与实际状态不一致，配置为:{self.auto_start}，实际为:{actual_auto_start}，将以配置为准"
                             )
 
-                        # 确保开机自启状态与配置一致
-                        if self.auto_start:
+                        # 按需创建/删除计划任务：只在状态不一致时才动 schtasks。
+                        # 每次启动都重建"最高权限计划任务"既拖慢启动，也是杀软眼中
+                        # 最典型的"静默持久化"特征（误报源之一）。
+                        if self.auto_start and not actual_auto_start:
                             enable_auto_start(self.app_info["name"])
-                        else:
+                        elif not self.auto_start and actual_auto_start:
                             disable_auto_start(self.app_info["name"])
 
                         logger.debug(f"已从配置文件加载开机自启设置: {self.auto_start}")
