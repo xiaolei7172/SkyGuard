@@ -43,6 +43,12 @@ DEFAULT_CONFIG = {
         "threshold": 80.0,                    # 内存占用触发阈值默认值(百分比)
         "cooldown": 60                        # 内存清理冷却时间默认值(秒)
     },
+    "schedule": {
+        "auto_clean_enabled": False,          # 定时自动清理默认关闭
+        "auto_clean_days": 7,                 # 自动清理间隔（天）
+        "auto_ip_enabled": False,             # 每日自动重测优选 IP 默认关闭
+        "auto_ip_hour": 3                     # 自动优选触发小时（24 小时制）
+    },
     "io_priority": {
         "processes": [                        # 需要自动设置I/O优先级的进程名列表
             {"name": "SGuard64.exe", "priority": 0},

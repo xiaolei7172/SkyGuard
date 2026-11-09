@@ -527,6 +527,33 @@ class AccelPage(QWidget):
 
         self.status_detail = QLabel("")
         self.status_detail.setStyleSheet("color: #8c8c8c;")
+
+        # 高级设置行：mihomo API 端口 + 内核路径（此前只能手编 config.yaml）
+        adv_row = QHBoxLayout()
+        adv_label = QLabel("高级:")
+        adv_label.setStyleSheet("color: #8c8c8c;")
+        adv_row.addWidget(adv_label)
+
+        adv_row.addWidget(QLabel("API 端口"))
+        self.api_port_spin = QSpinBox()
+        self.api_port_spin.setRange(1024, 65535)
+        self.api_port_spin.setValue(self.config_manager.proxy_clash_api_port)
+        self.api_port_spin.setToolTip("mihomo 控制 API 端口，重启代理后生效")
+        self.api_port_spin.valueChanged.connect(self.on_api_port_changed)
+        adv_row.addWidget(self.api_port_spin)
+
+        adv_row.addWidget(QLabel("内核路径"))
+        self.kernel_path_edit = QLineEdit(self.config_manager.proxy_kernel_path or "")
+        self.kernel_path_edit.setPlaceholderText("留空自动查找（含自动下载）")
+        self.kernel_path_edit.setToolTip("手动指定 mihomo 内核 exe 路径；修改后下次启动代理生效")
+        self.kernel_path_edit.editingFinished.connect(self.on_kernel_path_edited)
+        adv_row.addWidget(self.kernel_path_edit, 1)
+
+        kernel_browse_btn = QPushButton("浏览…")
+        kernel_browse_btn.clicked.connect(self.on_browse_kernel)
+        StyleHelper.set_button_type(kernel_browse_btn, "default")
+        adv_row.addWidget(kernel_browse_btn)
+        box.addLayout(adv_row)
         # 允许换行并放开最小宽度限制，窄窗口时折叠而不是把整页撑出横向滚动
         self.status_detail.setWordWrap(True)
         self.status_detail.setMinimumWidth(0)
@@ -891,7 +918,7 @@ class AccelPage(QWidget):
         StyleHelper.set_button_type(clear_btn, "default")
         row.addWidget(clear_btn)
         close_btn = QPushButton("断开选中")
-        close_btn.setToolTip("断开选中的活动连接（Clash 内核模式可用）")
+        close_btn.setToolTip("断开选中的活动连接（内置引擎与 Clash 内核模式均可用）")
         close_btn.clicked.connect(self.on_close_selected_conn)
         StyleHelper.set_button_type(close_btn, "default")
         row.addWidget(close_btn)
@@ -909,24 +936,40 @@ class AccelPage(QWidget):
         return group
 
     def on_close_selected_conn(self):
-        """断开一条活动连接（内核模式：调 mihomo API；内置模式暂不支持）。"""
-        if self._engine() != "clash":
-            QMessageBox.information(self, "断开连接",
-                                    "内置引擎暂不支持断开单条连接，可切到 Clash 内核使用。")
+        """断开一条活动连接（内核模式走 mihomo API；内置模式直接关 socket）。"""
+        if self._engine() == "clash":
+            if not (self.kernel is not None and self.kernel.running):
+                return
+            row = self.conn_table.currentRow()
+            conn_ids = getattr(self, "_conn_ids", [])
+            if row < 0 or row >= len(conn_ids):
+                QMessageBox.information(self, "断开连接", "请先在表格中选中一条连接。")
+                return
+            conn_id = conn_ids[row]
+            if not conn_id:
+                return
+
+            def work():
+                self.kernel.close_connection(conn_id)
+
+            self._run(work, lambda _r: self.conn_hint.setText("已断开选中连接"),
+                      lambda e: self.conn_hint.setText(f"断开失败：{e}"))
             return
-        if not (self.kernel is not None and self.kernel.running):
+
+        # 内置引擎：conn_id 是 begin() 记录的 id(client)
+        if not self.proxy.running:
             return
         row = self.conn_table.currentRow()
         conn_ids = getattr(self, "_conn_ids", [])
-        if row < 0 or row >= len(conn_ids):
+        if row < 0 or row >= len(conn_ids) or not conn_ids[row]:
             QMessageBox.information(self, "断开连接", "请先在表格中选中一条连接。")
             return
         conn_id = conn_ids[row]
-        if not conn_id:
-            return
 
         def work():
-            self.kernel.close_connection(conn_id)
+            ok = self.proxy.close_connection(conn_id)
+            if not ok:
+                raise RuntimeError("连接已结束或不存在")
 
         self._run(work, lambda _r: self.conn_hint.setText("已断开选中连接"),
                   lambda e: self.conn_hint.setText(f"断开失败：{e}"))
@@ -1049,6 +1092,33 @@ class AccelPage(QWidget):
             self.sub_hint.setText(f"内核下载失败：{err}")
 
         self._run(work, done, failed)
+
+    def on_api_port_changed(self, value):
+        """mihomo API 端口修改：落盘并提示重启生效。"""
+        if value == self.config_manager.proxy_clash_api_port:
+            return
+        self.config_manager.set_proxy_config(clash_api_port=value)
+        self.sub_hint.setText(f"API 端口已保存为 {value}，重启代理后生效")
+
+    def on_kernel_path_edited(self):
+        """手动指定内核路径：校验存在性后落盘。"""
+        path = self.kernel_path_edit.text().strip()
+        if path == (self.config_manager.proxy_kernel_path or ""):
+            return
+        if path and not os.path.isfile(path):
+            QMessageBox.warning(self, "内核路径", f"文件不存在：\n{path}")
+            return
+        self.config_manager.set_proxy_config(kernel_path=path)
+        self.kernel_label.setText(f"已指定内核：{path}" if path else "内核：自动查找")
+
+    def on_browse_kernel(self):
+        """浏览选择 mihomo 内核文件。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 mihomo 内核", "", "可执行文件 (*.exe);;所有文件 (*)")
+        if not path:
+            return
+        self.kernel_path_edit.setText(path)
+        self.on_kernel_path_edited()
 
     def _start_clash(self, port, host, on_done):
         """用 mihomo 内核启动代理。
@@ -1315,6 +1385,8 @@ class AccelPage(QWidget):
         if sig == self._stats_sig:
             return
         self._stats_sig = sig
+        # 行 → 连接 ID 映射（内置引擎断开单条连接用）
+        self._conn_ids = [item.get("conn_id") for item in rows]
         self.conn_table.setRowCount(len(rows))
         for r, item in enumerate(rows):
             target = f"{item['host']}:{item['port']}"

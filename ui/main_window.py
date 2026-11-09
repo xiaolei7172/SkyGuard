@@ -55,6 +55,7 @@ from ui.floating_window import create_floating_window
 from ui.dns_page import DnsPage
 from ui.accel_page import AccelPage
 from ui.pages import DiskCleanPage, StartupPage
+from ui.pages.stats_page import StatsPage
 from ui.styles import (
     ColorScheme,
     StyleHelper,
@@ -194,6 +195,18 @@ class MainWindow(QWidget):
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self.update_status)
         self.update_timer.start(1000)
+
+        # 用量采样：每 60s 把 DNS/代理的累计计数增量写入每日统计（统计中心页）
+        self._usage_last = {}
+        self._usage_timer = QTimer(self)
+        self._usage_timer.timeout.connect(self._sample_usage_stats)
+        self._usage_timer.start(60_000)
+
+        # 定时自动化任务巡检线程（每分钟看一次有没有到点；开关在设置页）
+        from utils.scheduled_tasks import ScheduledTaskManager
+        self.scheduled_tasks = ScheduledTaskManager(
+            self.config_manager, notify=self._notify_scheduled)
+        self.scheduled_tasks.start()
 
         # 状态缓存：内容没变就不 setText（富文本 setText 每次都要重新解析排版，
         # 实测每次 update_status 阻塞主线程约 16ms，是界面卡顿的最大来源）
@@ -684,12 +697,72 @@ class MainWindow(QWidget):
         window_group.setLayout(window_layout)
         settings_layout.addWidget(window_group)
 
+        # 定时自动化任务设置
+        schedule_group = QGroupBox("定时自动化任务")
+        schedule_layout = QVBoxLayout()
+
+        self.auto_clean_checkbox = QCheckBox("定时自动清理缓存（仅缓存类规则，强制回收站模式）")
+        self.auto_clean_checkbox.setChecked(self.config_manager.schedule_auto_clean_enabled)
+        self.auto_clean_checkbox.stateChanged.connect(self.on_auto_clean_toggled)
+        schedule_layout.addWidget(self.auto_clean_checkbox)
+
+        auto_clean_row = QHBoxLayout()
+        auto_clean_row.addWidget(QLabel("清理间隔:"))
+        self.auto_clean_days_spin = QSpinBox()
+        self.auto_clean_days_spin.setRange(1, 90)
+        self.auto_clean_days_spin.setSuffix(" 天")
+        self.auto_clean_days_spin.setValue(self.config_manager.schedule_auto_clean_days)
+        self.auto_clean_days_spin.valueChanged.connect(self.on_auto_clean_days_changed)
+        auto_clean_row.addWidget(self.auto_clean_days_spin)
+        auto_clean_row.addStretch()
+        schedule_layout.addLayout(auto_clean_row)
+
+        self.auto_ip_checkbox = QCheckBox("每日自动重测优选 IP（GitHub / Steam，自动更新缓存）")
+        self.auto_ip_checkbox.setChecked(self.config_manager.schedule_auto_ip_enabled)
+        self.auto_ip_checkbox.stateChanged.connect(self.on_auto_ip_toggled)
+        schedule_layout.addWidget(self.auto_ip_checkbox)
+
+        auto_ip_row = QHBoxLayout()
+        auto_ip_row.addWidget(QLabel("每天触发时间:"))
+        self.auto_ip_hour_spin = QSpinBox()
+        self.auto_ip_hour_spin.setRange(0, 23)
+        self.auto_ip_hour_spin.setSuffix(" 点")
+        self.auto_ip_hour_spin.setValue(self.config_manager.schedule_auto_ip_hour)
+        self.auto_ip_hour_spin.valueChanged.connect(self.on_auto_ip_hour_changed)
+        auto_ip_row.addWidget(self.auto_ip_hour_spin)
+        auto_ip_row.addStretch()
+        schedule_layout.addLayout(auto_ip_row)
+
+        schedule_info = QLabel(
+            "💡 程序在后台运行时才会触发；任务在设定时间前后 1 分钟内自动执行\n"
+            "💡 自动清理只碰浏览器/系统缓存等纯缓存目录，一律进回收站，可在统计中心查看记录"
+        )
+        schedule_info.setWordWrap(True)
+        StyleHelper.set_label_type(schedule_info, "info")
+        schedule_layout.addWidget(schedule_info)
+
+        schedule_group.setLayout(schedule_layout)
+        settings_layout.addWidget(schedule_group)
+
         # 日志设置
         log_group = QGroupBox("日志设置")
         log_layout = QVBoxLayout()
         self.debug_checkbox = QCheckBox("启用调试模式")
         self.debug_checkbox.stateChanged.connect(self.toggle_debug_mode)
         log_layout.addWidget(self.debug_checkbox)
+
+        # 日志保留天数（此前只能手编 config.yaml）
+        log_retention_layout = QHBoxLayout()
+        log_retention_layout.addWidget(QLabel("日志保留天数:"))
+        self.log_retention_spin = QSpinBox()
+        self.log_retention_spin.setRange(1, 365)
+        self.log_retention_spin.setValue(self.config_manager.log_retention_days)
+        self.log_retention_spin.setToolTip("超过保留天数的旧日志文件在下次启动时清理")
+        self.log_retention_spin.valueChanged.connect(self.on_log_retention_changed)
+        log_retention_layout.addWidget(self.log_retention_spin)
+        log_retention_layout.addStretch()
+        log_layout.addLayout(log_retention_layout)
+
         log_group.setLayout(log_layout)
         settings_layout.addWidget(log_group)
 
@@ -823,6 +896,10 @@ class MainWindow(QWidget):
         dns_placeholder = QWidget()
         self._lazy_pages[dns_placeholder] = (
             lambda: DnsPage(self.config_manager), "  🛡 DNS 过滤器  ", "dns_page")
+        stats_placeholder = QWidget()
+        self._lazy_pages[stats_placeholder] = (
+            lambda: StatsPage(config_manager=self.config_manager),
+            "  📈 统计中心  ", "stats_page")
 
         # 添加选项卡
         self.tabs.addTab(status_tab, "  程序状态  ")
@@ -832,6 +909,7 @@ class MainWindow(QWidget):
         self.tabs.addTab(self.startup_page, "  🚀 开机优化  ")
         self.tabs.addTab(dns_placeholder, "  🛡 DNS 过滤器  ")
         self.tabs.addTab(self.accel_page, "  🚀 网络加速  ")
+        self.tabs.addTab(stats_placeholder, "  📈 统计中心  ")
         self.tabs.addTab(settings_tab, "  设置  ")
 
         # 首次切到这些页时再创建/加载数据，避免启动变慢
@@ -2031,6 +2109,10 @@ class MainWindow(QWidget):
         if getattr(self, "accel_page", None) is not None:
             self.accel_page.shutdown()
 
+        # 停止定时自动化任务巡检线程
+        if getattr(self, "scheduled_tasks", None) is not None:
+            self.scheduled_tasks.stop()
+
         # 停止定时器（在主线程中处理）
         if hasattr(self, "update_timer") and self.update_timer:
             self.update_timer.stop()
@@ -2063,6 +2145,71 @@ class MainWindow(QWidget):
             # 直接退出程序
             event.accept()
             self.exit_app()
+
+    def on_log_retention_changed(self, value):
+        """日志保留天数修改：落盘。"""
+        if value == self.config_manager.log_retention_days:
+            return
+        self.config_manager.log_retention_days = value
+        if not self.config_manager.save_config():
+            logger.warning("日志保留天数保存失败，本次修改仅在当前会话生效")
+
+    def _notify_scheduled(self, message):
+        """定时任务完成提示（走系统通知，受通知开关控制）。"""
+        try:
+            if getattr(self.config_manager, "show_notifications", False):
+                send_notification(title="SkyGuard 定时任务", message=message,
+                                  icon_path=self.icon_path)
+        except Exception as e:
+            logger.debug(f"定时任务通知发送失败: {e}")
+
+    def on_auto_clean_toggled(self, state):
+        self.config_manager.set_schedule_config(auto_clean_enabled=bool(state))
+
+    def on_auto_clean_days_changed(self, value):
+        self.config_manager.set_schedule_config(auto_clean_days=value)
+
+    def on_auto_ip_toggled(self, state):
+        self.config_manager.set_schedule_config(auto_ip_enabled=bool(state))
+
+    def on_auto_ip_hour_changed(self, value):
+        self.config_manager.set_schedule_config(auto_ip_hour=value)
+
+    def _sample_usage_stats(self):
+        """采样 DNS/代理累计计数，把增量写入每日统计。
+
+        服务重启后计数器清零：当前值小于上次采样值时按 0 增量处理。
+        """
+        try:
+            from utils import stats_history
+
+            def _cum(page, attr_stats, names):
+                if page is None:
+                    return {n: 0 for n in names}
+                stats = getattr(page, attr_stats)
+                return {n: int(getattr(stats, n, 0) or 0) for n in names}
+
+            # DNS（dns_page 懒创建，未创建过说明用户没用过 DNS 页 → 0）
+            dns = _cum(getattr(self, "dns_page", None), "filter.stats",
+                       ("total", "blocked"))
+            # 代理：仅内置引擎有累计计数（mihomo 内核走 API 只有速率）
+            accel = getattr(self, "accel_page", None)
+            proxy = _cum(getattr(accel, "proxy", None), "stats",
+                         ("total", "up_bytes", "down_bytes"))
+
+            last = self._usage_last
+            delta = {}
+            cur = {"dns_queries": dns["total"], "dns_blocked": dns["blocked"],
+                   "proxy_total": proxy["total"],
+                   "proxy_up": proxy["up_bytes"], "proxy_down": proxy["down_bytes"]}
+            for key, val in cur.items():
+                prev = last.get(key)
+                delta[key] = val - prev if prev is not None and val >= prev else 0
+            self._usage_last = cur
+
+            stats_history.record_delta(**delta)
+        except Exception as e:
+            logger.debug(f"用量采样失败: {e}")
 
     def toggle_debug_mode(self):
         """切换调试模式"""
@@ -2309,22 +2456,54 @@ class MainWindow(QWidget):
         # 服务列表
         services = ["ACE-GAME", "ACE-BASE", "AntiCheatExpert Service", "AntiCheatExpert Protection"]
 
-        # 创建进度对话框
+        # 创建进度对话框（取消按钮真正可停：canceled → 置停止事件）
+        self._delete_services_stop = threading.Event()
         self.delete_progress_dialog = QProgressDialog("正在删除ACE服务...", "取消", 0, len(services), self)
         self.delete_progress_dialog.setWindowTitle("删除服务")
         self.delete_progress_dialog.setMinimumDuration(0)
         self.delete_progress_dialog.setValue(0)
+        self.delete_progress_dialog.canceled.connect(self._delete_services_stop.set)
         self.delete_progress_dialog.show()
 
         # 使用线程执行删除操作
-        threading.Thread(target=self._delete_services_thread, args=(services, self.delete_progress_dialog), daemon=True).start()
+        threading.Thread(
+            target=self._delete_services_thread,
+            args=(services, self.delete_progress_dialog, self._delete_services_stop),
+            daemon=True,
+        ).start()
 
-    def _delete_services_thread(self, services, progress):
+    def _wait_for_service_state(self, service, stop_event, *, want_gone, timeout=4.0):
+        """轮询等待服务达到期望状态，替代固定 sleep(2)。
+
+        want_gone=True  期望服务已删除（不存在）；
+        want_gone=False 期望服务已停止。
+        返回 (exists, status)；用户取消返回 (None, None)。
+        """
+        deadline = time.time() + timeout
+        last = (None, None)
+        while time.time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return None, None
+            self.monitor.invalidate_service_cache(service)
+            exists, status, _ = self.monitor.check_service_status(service)
+            last = (exists, status)
+            if want_gone and not exists:
+                return exists, status
+            if not want_gone and (not exists or status == "stopped"):
+                return exists, status
+            time.sleep(0.25)
+        return last
+
+    def _delete_services_thread(self, services, progress, stop_event=None):
         """线程函数：删除服务"""
         results = []
         success_count = 0
 
         for i, service in enumerate(services):
+            if stop_event is not None and stop_event.is_set():
+                results.append(f"{service}: 已取消")
+                continue
+
             # 使用信号更新进度
             self.delete_progress_signal.emit(i)
 
@@ -2348,13 +2527,11 @@ class MainWindow(QWidget):
                     capture_output=True, text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW, check=False,
                 )
-                # 等待操作完成后失效缓存再校验，避免读到操作前的状态
-                time.sleep(2)
-                self.monitor.invalidate_service_cache(service)
-
-                # 校验服务是否已删除
-                exists, _, _ = self.monitor.check_service_status(service)
-                if exists:
+                # 轮询等待删除生效（最长 4s，通常远快于此），用户可中途取消
+                exists, _ = self._wait_for_service_state(service, stop_event, want_gone=True)
+                if exists is None:
+                    results.append(f"{service}: 已取消")
+                elif exists:
                     results.append(f"{service}: 删除失败")
                 else:
                     results.append(f"{service}: 已成功删除")
@@ -2575,14 +2752,24 @@ class MainWindow(QWidget):
         self.stop_progress_dialog.show()
 
         # 使用线程执行停止操作
-        threading.Thread(target=self._stop_services_thread, args=(services, self.stop_progress_dialog), daemon=True).start()
+        self._stop_services_stop = threading.Event()
+        self.stop_progress_dialog.canceled.connect(self._stop_services_stop.set)
+        threading.Thread(
+            target=self._stop_services_thread,
+            args=(services, self.stop_progress_dialog, self._stop_services_stop),
+            daemon=True,
+        ).start()
 
-    def _stop_services_thread(self, services, progress):
+    def _stop_services_thread(self, services, progress, stop_event=None):
         """线程函数：停止服务"""
         results = []
         success_count = 0
 
         for i, service in enumerate(services):
+            if stop_event is not None and stop_event.is_set():
+                results.append(f"{service}: 已取消")
+                continue
+
             # 使用信号更新进度
             self.stop_progress_signal.emit(i)
 
@@ -2606,13 +2793,12 @@ class MainWindow(QWidget):
                     capture_output=True, text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW, check=False,
                 )
-                # 等待操作完成后失效缓存再校验，避免读到操作前的状态
-                time.sleep(2)
-                self.monitor.invalidate_service_cache(service)
-
-                # 校验服务是否已停止
-                exists, new_status, _ = self.monitor.check_service_status(service)
-                if exists and new_status.lower() != "stopped":
+                # 轮询等待停止生效（最长 4s），用户可中途取消
+                exists, new_status = self._wait_for_service_state(
+                    service, stop_event, want_gone=False)
+                if exists is None:
+                    results.append(f"{service}: 已取消")
+                elif exists and new_status.lower() != "stopped":
                     results.append(f"{service}: 停止失败")
                 else:
                     results.append(f"{service}: 已成功停止")

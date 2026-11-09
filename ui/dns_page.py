@@ -174,6 +174,16 @@ class DnsPage(QWidget):
         StyleHelper.set_button_type(self.selfcheck_btn, "default")
         btn_row.addWidget(self.selfcheck_btn)
 
+        # 服务端口（此前只能手编 config.yaml）：改动即保存，运行中则热重启
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(self.config_manager.dns_port)
+        self.port_spin.setToolTip("本地 DNS 服务监听端口（系统接管时网卡会指向它）；\n"
+                                  "修改后立即保存，服务运行中会自动以新端口重启")
+        self.port_spin.valueChanged.connect(self.on_port_changed)
+        btn_row.addWidget(QLabel("端口"))
+        btn_row.addWidget(self.port_spin)
+
         self.stop_btn = QPushButton("停止服务")
         self.stop_btn.setToolTip("停止本地 DNS 服务，并自动恢复系统 DNS")
         self.stop_btn.clicked.connect(self.on_stop)
@@ -764,6 +774,45 @@ class DnsPage(QWidget):
         ok = self.filter.start()
         self._update_state()
         return ok, list(self.filter.bind_errors)
+
+    def on_port_changed(self, value):
+        """服务端口修改：落盘、刷新显示，运行中则自动以新端口重启。
+
+        约束：系统 DNS 接管后网卡指向 127.0.0.1（Windows 固定走 53 端口），
+        接管状态下端口必须保持 53，否则整机解析直接断掉。
+        """
+        old_port = self.config_manager.dns_port
+        if value == old_port:
+            return
+
+        def _revert():
+            self.port_spin.blockSignals(True)
+            self.port_spin.setValue(old_port)
+            self.port_spin.blockSignals(False)
+
+        if value != 53 and dns_takeover.has_backup():
+            QMessageBox.warning(
+                self, "DNS 服务",
+                "系统 DNS 已被接管（网卡指向本机 53 端口），服务端口必须保持 53。\n"
+                "请先「恢复系统 DNS」，再修改端口。")
+            _revert()
+            return
+
+        self.config_manager.set_dns_config(port=value)
+        self.listen_label.setText(
+            f"监听 {'、'.join(self._listen_hosts())} :: 端口 {value}")
+        if not self.filter.running:
+            return
+        self.filter.stop()
+        ok, errors = self._start_service()
+        if not ok:
+            QMessageBox.critical(
+                self, "DNS 服务",
+                f"新端口 {value} 启动失败（可能被占用，已改回 {old_port}）：\n" + "\n".join(errors))
+            self.config_manager.set_dns_config(port=old_port)
+            self.listen_label.setText(
+                f"监听 {'、'.join(self._listen_hosts())} :: 端口 {old_port}")
+            _revert()
 
     def on_selfcheck(self):
         """自检 DNS 服务：临时端口起一份实例实测，不影响正在运行的服务与系统设置。"""

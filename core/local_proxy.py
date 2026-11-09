@@ -205,7 +205,7 @@ class ProxyStats:
         self.failed = 0
         self.recent = deque(maxlen=log_limit)
 
-    def begin(self, host, port, action, rule, node_name=""):
+    def begin(self, host, port, action, rule, node_name="", conn_id=None):
         entry = {
             "time": time.strftime("%H:%M:%S"),
             "host": host,
@@ -213,6 +213,7 @@ class ProxyStats:
             "action": action,
             "rule": rule,
             "node": node_name,
+            "conn_id": conn_id,
             "up": 0,
             "down": 0,
             "result": "连接中",
@@ -395,6 +396,31 @@ class LocalProxy:
             except Exception:
                 pass
 
+    def close_connection(self, conn_id):
+        """按连接 ID 强制断开客户端 socket（内置引擎连接管理）。
+
+        conn_id 为 begin() 时记录的 id(client)。返回是否找到并关闭。
+        """
+        if conn_id is None:
+            return False
+        with self._conns_lock:
+            target = None
+            for c in self._conns:
+                if id(c) == conn_id:
+                    target = c
+                    break
+        if target is None:
+            return False
+        try:
+            target.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # 对端可能已关闭，直接 close 兜底
+        try:
+            target.close()
+        except OSError:
+            pass
+        return True
+
     # -- 出站 --------------------------------------------------------
     def _open_upstream(self, host, port, action):
         """
@@ -475,7 +501,7 @@ class LocalProxy:
     def _serve(self, client, host, port, is_connect, prelude=b""):
         """匹配规则、建立上游、回写响应并转发。"""
         action, rule = self.engine.match(host, port)
-        entry = self.stats.begin(host, port, action, rule)
+        entry = self.stats.begin(host, port, action, rule, conn_id=id(client))
 
         if action == ACTION_REJECT:
             self.stats.finish(entry, error="已拒绝")
@@ -604,7 +630,7 @@ class LocalProxy:
             return
 
         action, rule = self.engine.match(host, port)
-        entry = self.stats.begin(host, port, action, rule)
+        entry = self.stats.begin(host, port, action, rule, conn_id=id(client))
         if action == ACTION_REJECT:
             self.stats.finish(entry, error="已拒绝")
             _send(client, b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")

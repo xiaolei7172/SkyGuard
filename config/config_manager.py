@@ -84,6 +84,13 @@ class ConfigManager:
         # I/O优先级设置
         self.io_priority_processes = self.default_config["io_priority"]["processes"].copy()
 
+        # 定时自动化任务设置
+        schedule = self.default_config["schedule"]
+        self.schedule_auto_clean_enabled = schedule["auto_clean_enabled"]
+        self.schedule_auto_clean_days = schedule["auto_clean_days"]
+        self.schedule_auto_ip_enabled = schedule["auto_ip_enabled"]
+        self.schedule_auto_ip_hour = schedule["auto_ip_hour"]
+
         # 悬浮窗设置
         floating = self.default_config["floating_window"]
         self.floating_enabled = floating["enabled"]
@@ -269,6 +276,25 @@ class ConfigManager:
                     self.io_priority_processes = config_data["io_priority"]["processes"]
                     logger.debug(f"已从配置文件加载I/O优先级设置，进程数量: {len(self.io_priority_processes)}")
 
+                # 读取定时自动化任务设置
+                if isinstance(config_data.get("schedule"), dict):
+                    sched = config_data["schedule"]
+                    self.schedule_auto_clean_enabled = bool(
+                        sched.get("auto_clean_enabled", self.schedule_auto_clean_enabled))
+                    try:
+                        self.schedule_auto_clean_days = min(90, max(
+                            1, int(sched.get("auto_clean_days", self.schedule_auto_clean_days))))
+                    except (TypeError, ValueError):
+                        pass
+                    self.schedule_auto_ip_enabled = bool(
+                        sched.get("auto_ip_enabled", self.schedule_auto_ip_enabled))
+                    try:
+                        self.schedule_auto_ip_hour = min(23, max(
+                            0, int(sched.get("auto_ip_hour", self.schedule_auto_ip_hour))))
+                    except (TypeError, ValueError):
+                        pass
+                    logger.debug("已从配置文件加载定时任务设置")
+
                 # 读取悬浮窗设置（旧版配置文件没有这一段，保持默认即可）
                 if isinstance(config_data.get("floating_window"), dict):
                     self._load_floating_config(config_data["floating_window"])
@@ -323,6 +349,13 @@ class ConfigManager:
             # 加载I/O优先级默认设置
             self.io_priority_processes = self.default_config["io_priority"]["processes"].copy()
 
+            # 加载定时任务默认设置
+            schedule = self.default_config["schedule"]
+            self.schedule_auto_clean_enabled = schedule["auto_clean_enabled"]
+            self.schedule_auto_clean_days = schedule["auto_clean_days"]
+            self.schedule_auto_ip_enabled = schedule["auto_ip_enabled"]
+            self.schedule_auto_ip_hour = schedule["auto_ip_hour"]
+
             # 加载悬浮窗默认设置
             self._load_floating_config(self.default_config["floating_window"])
 
@@ -368,6 +401,12 @@ class ConfigManager:
                     "cooldown": self.memory_cleaner_cooldown,
                 },
                 "io_priority": {"processes": self.io_priority_processes},
+                "schedule": {
+                    "auto_clean_enabled": self.schedule_auto_clean_enabled,
+                    "auto_clean_days": self.schedule_auto_clean_days,
+                    "auto_ip_enabled": self.schedule_auto_ip_enabled,
+                    "auto_ip_hour": self.schedule_auto_ip_hour,
+                },
                 "floating_window": {
                     "enabled": self.floating_enabled,
                     "opacity": self.floating_opacity,
@@ -676,6 +715,21 @@ class ConfigManager:
         """悬浮窗设置变更后落盘。写失败只记日志，不影响界面继续用。"""
         if not self.save_config():
             logger.warning("悬浮窗设置保存失败，本次修改仅在当前会话生效")
+
+    def set_schedule_config(self, **kwargs):
+        """更新定时自动化任务配置并落盘。"""
+        mapping = {
+            "auto_clean_enabled": "schedule_auto_clean_enabled",
+            "auto_clean_days": "schedule_auto_clean_days",
+            "auto_ip_enabled": "schedule_auto_ip_enabled",
+            "auto_ip_hour": "schedule_auto_ip_hour",
+        }
+        for key, value in kwargs.items():
+            attr = mapping.get(key)
+            if attr:
+                setattr(self, attr, value)
+        if not self.save_config():
+            logger.warning("定时任务设置保存失败，本次修改仅在当前会话生效")
 
     def set_floating_enabled(self, enabled):
         self.floating_enabled = bool(enabled)

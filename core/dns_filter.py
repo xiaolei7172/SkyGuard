@@ -107,7 +107,7 @@ class Upstream:
         norm = proto.strip().upper()
         self.proto = {"DOH": PROTO_DOH, "DOT": PROTO_DOT, "UDP": PROTO_UDP}.get(norm, PROTO_UDP)
         self.address = address.strip()
-        self._doh_session = None
+        self._doh_local = threading.local()  # 每线程独立 DoH Session
         self._lock = threading.Lock()
 
     # ---------------- 对外查询接口 ----------------
@@ -159,11 +159,14 @@ class Upstream:
         return self._recv_exact(tls, length)
 
     def _query_doh(self, wire_query, timeout):
-        with self._lock:
-            if self._doh_session is None:
-                self._doh_session = requests.Session()
-                self._doh_session.headers.update({"Accept": "application/dns-message"})
-        resp = self._doh_session.post(
+        # requests.Session 非线程安全：DNS handler 是多线程，
+        # 用 thread-local 各持一份连接池（底层 urllib3 池无法跨 Session 共享）
+        session = getattr(self._doh_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update({"Accept": "application/dns-message"})
+            self._doh_local.session = session
+        resp = session.post(
             self.address,
             data=wire_query,
             headers={"Content-Type": "application/dns-message"},
