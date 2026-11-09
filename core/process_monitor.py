@@ -104,12 +104,15 @@ class GameProcessMonitor:
                 pass
             self.last_cache_refresh = current_time
 
-    def is_process_running(self, process_name):
+    def is_process_running(self, process_name, stale_ok=False):
         """
         检查进程是否在运行
 
         Args:
             process_name (str): 进程名称
+            stale_ok (bool): 仅用于界面展示时传 True——只读缓存、缓存未建立时
+                才做一次全量枚举。全量枚举约 3-7ms，状态页每秒调用会让主线程
+                周期性卡顿；监控线程每 10 秒会自行刷新缓存供这里读取。
 
         Returns:
             psutil.Process or None: 进程对象，未找到则返回None
@@ -118,6 +121,10 @@ class GameProcessMonitor:
             return None
 
         process_name_lower = process_name.lower()
+
+        # 展示模式：缓存从未建立时先建一次，之后只读缓存不做全量枚举
+        if stale_ok and self.last_cache_refresh == 0:
+            self.refresh_process_cache(force=True)
 
         # 先从缓存中查找
         if process_name_lower in self.process_cache:
@@ -129,6 +136,10 @@ class GameProcessMonitor:
                     del self.process_cache[process_name_lower]
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 del self.process_cache[process_name_lower]
+
+        # stale_ok 模式下不回退到全量枚举（宁可显示略旧的状态）
+        if stale_ok:
+            return None
 
         # 缓存中没有找到，则遍历所有进程
         try:

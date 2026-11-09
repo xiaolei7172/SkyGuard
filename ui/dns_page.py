@@ -1011,7 +1011,15 @@ class DnsPage(QWidget):
             return
         log = self.filter.stats.query_log
         result = self.log_result.currentData() or "all"
-        rows = log.snapshot(result=result, search=self.log_search.text(), limit=200)
+        search = self.log_search.text()
+        rows = log.snapshot(result=result, search=search, limit=200)
+        # 数据没变就跳过重建（200 行 × 6 列的 QTableWidgetItem 重建开销不小）
+        head = rows[0] if rows else None
+        sig = (result, search, len(rows),
+               (head["ts"], head["domain"], head["result"]) if head else None)
+        if sig == getattr(self, "_log_sig", None):
+            return
+        self._log_sig = sig
         self.log_table.setRowCount(len(rows))
         for r, e in enumerate(rows):
             cells = [e["time"], e["client"], e["domain"], e["qtype"],
@@ -1396,19 +1404,32 @@ class DnsPage(QWidget):
 
     def _update_state(self):
         running = self.filter.running
+        sel = self.filter.get_selected_upstream()
+        rules = self.filter.rules
+
+        # 状态没变化就整体跳过：下面全是 setText/setStyleSheet，
+        # 每次都会触发重排版，是 DNS 页每 2 秒卡一下的主因
+        dns_state = "未接管"
+        if sel and dns_takeover._load_backup():
+            dns_state = "已接管"
+        sig = (running, self.filter.port, tuple(self.filter.bind_errors),
+               sel.name if sel else None,
+               getattr(sel, "proto", None),
+               self.filter.upstream_strategy,
+               rules.count, rules.allow_count, len(self.filter.rewrites),
+               dns_state)
+        if sig == getattr(self, "_state_sig", None):
+            return
+        self._state_sig = sig
+
         if running:
             self.status_pill.setText(f"● 运行中 · 端口 {self.filter.port}")
         else:
             self.status_pill.setText("● 未运行")
         self._style_pill(running)
 
-        sel = self.filter.get_selected_upstream()
-        dns_state = "未接管"
-        if sel:
-            backup = dns_takeover._load_backup()
-            if backup:
-                dns_state = "已接管 · 本机 DNS 指向 127.0.0.1 / ::1"
-        rules = self.filter.rules
+        dns_state_text = ("已接管 · 本机 DNS 指向 127.0.0.1 / ::1"
+                          if dns_state != "未接管" else "未接管")
         lines = [
             f"<b>服务：</b>{'运行中' if running else '未运行'} · 端口 {self.filter.port}"
             + (f"（监听失败：{'; '.join(self.filter.bind_errors)}）"
@@ -1417,7 +1438,7 @@ class DnsPage(QWidget):
             f"<b>策略：</b>{'并行最快' if self.filter.upstream_strategy == 'parallel' else '顺序优先'}",
             f"<b>规则：</b>{rules.count} 条（例外 {rules.allow_count}）· "
             f"重写 {len(self.filter.rewrites)} 条",
-            f"<b>系统 DNS：</b>{dns_state}",
+            f"<b>系统 DNS：</b>{dns_state_text}",
         ]
         self.state_label.setText("<br>".join(lines))
         self._refresh_easy_state(running, sel, rules)
@@ -1425,6 +1446,11 @@ class DnsPage(QWidget):
     def _refresh_easy_state(self, running, sel, rules):
         if not hasattr(self, "easy_btn"):
             return
+        easy_sig = (running, sel.name if sel else None, getattr(sel, "proto", None),
+                    rules.count, len(self.filter.rewrites))
+        if easy_sig == getattr(self, "_easy_sig", None):
+            return
+        self._easy_sig = easy_sig
         self.easy_btn.setText("⏹ 一键关闭" if running else "🚀 一键开启")
         StyleHelper.set_button_type(self.easy_btn, "danger" if running else "primary")
         self.easy_dot.setStyleSheet(

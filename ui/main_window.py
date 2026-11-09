@@ -128,6 +128,12 @@ class MainWindow(QWidget):
         self.update_timer.timeout.connect(self.update_status)
         self.update_timer.start(1000)
 
+        # 状态缓存：内容没变就不 setText（富文本 setText 每次都要重新解析排版，
+        # 实测每次 update_status 阻塞主线程约 16ms，是界面卡顿的最大来源）
+        self._status_sig = None
+        self._mem_sig = None
+        self._tray_tip = None
+
         # 应用初始主题
         theme_manager.set_theme(self.current_theme)
 
@@ -730,31 +736,58 @@ class MainWindow(QWidget):
         # 添加空白占位
         settings_layout.addStretch()
 
-        # 垃圾清理选项卡
-        self.disk_clean_page = DiskCleanPage()
+        # 垃圾清理选项卡（懒创建：首次点进去再实例化，省 110ms 启动时间）
+        self.disk_clean_page = None
         # 开机优化选项卡
         self.startup_page = StartupPage()
-        # DNS 过滤器选项卡（服务不随程序自动启动）
-        self.dns_page = DnsPage(self.config_manager)
+        # DNS 过滤器选项卡（懒创建，服务不随程序自动启动；省 80ms 启动时间）
+        self.dns_page = None
         # 网络加速选项卡（代理 / 机场订阅 / GitHub-Steam 优选 IP）
+        # 注意：本页含「随程序自动启动代理」逻辑，必须随主窗口立即创建
         self.accel_page = AccelPage(self.config_manager)
+
+        # 懒创建注册表：占位页 -> (构造函数, 页签标题, 属性名)
+        self._lazy_pages = {}
+        self._building_page = False
+
+        disk_placeholder = QWidget()
+        self._lazy_pages[disk_placeholder] = (
+            lambda: DiskCleanPage(), "  🧹 垃圾清理  ", "disk_clean_page")
+        dns_placeholder = QWidget()
+        self._lazy_pages[dns_placeholder] = (
+            lambda: DnsPage(self.config_manager), "  🛡 DNS 过滤器  ", "dns_page")
 
         # 添加选项卡
         self.tabs.addTab(status_tab, "  程序状态  ")
         self.tabs.addTab(process_tab, "  进程监控  ")
         self.tabs.addTab(memory_tab, "  内存清理  ")
-        self.tabs.addTab(self.disk_clean_page, "  🧹 垃圾清理  ")
+        self.tabs.addTab(disk_placeholder, "  🧹 垃圾清理  ")
         self.tabs.addTab(self.startup_page, "  🚀 开机优化  ")
-        self.tabs.addTab(self.dns_page, "  🛡 DNS 过滤器  ")
+        self.tabs.addTab(dns_placeholder, "  🛡 DNS 过滤器  ")
         self.tabs.addTab(self.accel_page, "  🚀 网络加速  ")
         self.tabs.addTab(settings_tab, "  设置  ")
 
-        # 首次切到这两个页时再加载数据，避免启动变慢
+        # 首次切到这些页时再创建/加载数据，避免启动变慢
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
     def _on_tab_changed(self, index):
-        """按需懒加载新页面数据"""
+        """首次进入懒创建页时实例化真实页面，并按需加载数据"""
         widget = self.tabs.widget(index)
+        factory = self._lazy_pages.get(widget)
+        if factory is not None and not self._building_page:
+            self._building_page = True
+            try:
+                ctor, title, attr_name = factory
+                page = ctor()
+                setattr(self, attr_name, page)
+                self._lazy_pages.pop(widget)
+                tab_index = self.tabs.indexOf(widget)
+                self.tabs.removeTab(tab_index)
+                self.tabs.insertTab(tab_index, page, title)
+                self.tabs.setCurrentIndex(tab_index)
+            finally:
+                self._building_page = False
+            return
         if widget is self.startup_page and not getattr(self, "_startup_loaded", False):
             self._startup_loaded = True
             self.startup_page.refresh()
@@ -1023,7 +1056,7 @@ class MainWindow(QWidget):
         html.append('<div class="section-title">进程状态</div>')
 
         # ACE进程状态(ACE反作弊程序是否安装提示弹窗)
-        ace_running = self.monitor.is_process_running(self.monitor.anticheat_name) is not None
+        ace_running = self.monitor.is_process_running(self.monitor.anticheat_name, stale_ok=True) is not None
 
         if ace_running and self.monitor.anticheat_killed:
             html.append(
@@ -1039,7 +1072,7 @@ class MainWindow(QWidget):
             )
 
         # SGuard64进程状态
-        scan_running = self.monitor.is_process_running(self.monitor.scanprocess_name) is not None
+        scan_running = self.monitor.is_process_running(self.monitor.scanprocess_name, stale_ok=True) is not None
 
         # 如果进程在运行，直接检查其优化状态并更新全局标志
         if scan_running:
@@ -1135,8 +1168,10 @@ class MainWindow(QWidget):
                     status_class = "status-warning"
 
                 html.append(f'<p class="status-item">🛡️ 内存清理: <span class="status-success">已启用</span></p>')
+                # 数值取整粒度显示：内存百分比按 1%、缓存按整数 GB，
+                # 否则状态页 HTML 每秒都变，触发 12ms 的富文本重排版
                 html.append(
-                    f'<p class="status-item">🍋‍🟩 内存使用: <span class="{status_class}">{used_percent:.1f}%</span> ({used_gb:.1f}GB / {total_gb:.1f}GB)</p>'
+                    f'<p class="status-item">🍋‍🟩 内存使用: <span class="{status_class}">{int(used_percent)}%</span> ({used_gb:.1f}GB / {total_gb:.1f}GB)</p>'
                 )
 
                 # 添加自定义清理配置信息
@@ -1313,37 +1348,53 @@ class MainWindow(QWidget):
         self.blockSignals(False)
 
     def update_status(self):
-        """更新状态信息"""
-        if not self.monitor:
-            self.status_label.setText("<p>程序未启动</p>")
+        """更新状态信息（内容无变化 / 页签不可见时跳过，避免每秒重排版卡顿）"""
+        if not self.isVisible():
             return
 
-        # 获取状态HTML
-        status_html = self.get_status_html()
+        current_tab = self.tabs.currentIndex()
 
-        # 设置状态文本
-        self.status_label.setText(status_html)
+        # 程序状态页：富文本 HTML 解析+排版约 12ms，只有该页可见时才值得做
+        if current_tab == 0:
+            if not self.monitor:
+                if self._status_sig != "stopped":
+                    self._status_sig = "stopped"
+                    self.status_label.setText("<p>程序未启动</p>")
+            else:
+                # 获取状态HTML（内容没变就不 setText）
+                status_html = self.get_status_html()
+                if status_html != self._status_sig:
+                    self._status_sig = status_html
+                    self.status_label.setText(status_html)
 
-        # 更新内存信息显示
-        self.update_memory_status()
+        # 内存清理页：同样只在可见时刷新
+        if current_tab == 2:
+            self.update_memory_status()
 
-        # 更新托盘图标提示
-        if self.tray_icon:
+        # 更新托盘图标提示（节流到 5 秒一次，且只在文本变化时设置）
+        now = time.time()
+        if self.tray_icon and now - getattr(self, "_tray_tip_time", 0) >= 5:
+            self._tray_tip_time = now
             mem_info = self.memory_cleaner.get_memory_info() if self.memory_cleaner.running else None
             mem_usage = f" - 内存: {mem_info['percent']:.1f}%" if mem_info else ""
-            self.tray_icon.setToolTip(f"SkyGuard - {'运行中' if self.monitor.running else '已停止'}{mem_usage}")
+            tip = f"SkyGuard - {'运行中' if self.monitor.running else '已停止'}{mem_usage}" if self.monitor else "SkyGuard"
+            if tip != self._tray_tip:
+                self._tray_tip = tip
+                self.tray_icon.setToolTip(tip)
 
     def update_memory_status(self):
-        """更新内存状态显示"""
+        """更新内存状态显示（值没变化就跳过 setText / polish，避免每秒重排版）"""
         # 更新内存信息
         mem_info = self.memory_cleaner.get_memory_info()
 
         if not mem_info:
-            self.memory_info_label.setText("无法获取内存信息")
-            self.cache_info_label.setText("系统缓存: 无法获取信息")
-            self.config_info_label.setText("配置信息: 无法获取信息")
-            self.clean_stats_label.setText("清理统计: 暂无数据")
-            self.memory_progress.setValue(0)
+            if self._mem_sig != "unavailable":
+                self._mem_sig = "unavailable"
+                self.memory_info_label.setText("无法获取内存信息")
+                self.cache_info_label.setText("系统缓存: 无法获取信息")
+                self.config_info_label.setText("配置信息: 无法获取信息")
+                self.clean_stats_label.setText("清理统计: 暂无数据")
+                self.memory_progress.setValue(0)
             return
 
         used_percent = mem_info["percent"]
@@ -1353,55 +1404,25 @@ class MainWindow(QWidget):
         # 获取系统缓存信息
         cache_info = self.memory_cleaner.get_system_cache_info()
 
-        # 更新标签文本
-        self.memory_info_label.setText(f"物理内存: {used_gb:.1f}GB / {total_gb:.1f}GB ({used_percent:.1f}%)")
-
-        # 更新缓存信息标签
+        # 生成目标文本与档位（不直接碰控件）
         if cache_info:
             cache_size_gb = cache_info["current_size"] / (1024**3)
             cache_peak_gb = cache_info["peak_size"] / (1024**3)
             cache_percent = (cache_size_gb / total_gb) * 100 if total_gb > 0 else 0
-            self.cache_info_label.setText(
+            cache_text = (
                 f"系统缓存: 当前 {cache_size_gb:.1f}GB ({cache_percent:.1f}%) | 峰值 {cache_peak_gb:.1f}GB"
             )
-
-            # 根据缓存占用设置标签类型
-            if cache_percent > 30:
-                StyleHelper.set_label_type(self.cache_info_label, "error")
-            elif cache_percent > 20:
-                StyleHelper.set_label_type(self.cache_info_label, "warning")
-            else:
-                # 清除标签类型，使用默认样式
-                self.cache_info_label.setProperty("labelType", None)
-                self.cache_info_label.style().unpolish(self.cache_info_label)
-                self.cache_info_label.style().polish(self.cache_info_label)
+            cache_level = "error" if cache_percent > 30 else ("warning" if cache_percent > 20 else "")
         else:
-            self.cache_info_label.setText("系统缓存: 无法获取信息")
-            # 清除标签类型，使用默认样式
-            self.cache_info_label.setProperty("labelType", None)
-            self.cache_info_label.style().unpolish(self.cache_info_label)
-            self.cache_info_label.style().polish(self.cache_info_label)
+            cache_text = "系统缓存: 无法获取信息"
+            cache_level = ""
 
-        # 更新配置信息标签
         config_text = (
             f"配置: 清理间隔 {self.memory_cleaner.clean_interval}秒 | "
             f"触发阈值 {self.memory_cleaner.threshold}% | "
             f"冷却时间 {self.memory_cleaner.cooldown_time}秒"
         )
-        self.config_info_label.setText(config_text)
 
-        # 更新进度条
-        self.memory_progress.setValue(int(used_percent))
-
-        # 根据内存使用率设置进度条类型
-        if used_percent >= 80:
-            StyleHelper.set_progress_type(self.memory_progress, "memory-high")
-        elif used_percent >= 60:
-            StyleHelper.set_progress_type(self.memory_progress, "memory-medium")
-        else:
-            StyleHelper.set_progress_type(self.memory_progress, "memory-low")
-
-        # 更新清理统计信息
         stats = self.memory_cleaner.get_clean_stats()
         stats_text = (
             f"累计释放: {stats['total_cleaned_mb']:.2f}MB | "
@@ -1409,6 +1430,47 @@ class MainWindow(QWidget):
             f"清理次数: {stats['clean_count']} | "
             f"最后清理: {stats['last_clean_time']}"
         )
+
+        mem_level = "high" if used_percent >= 80 else ("medium" if used_percent >= 60 else "low")
+        progress_val = int(used_percent)
+
+        # 与上次比较，只有真正变化的才写入控件
+        sig = (f"{used_gb:.1f}|{total_gb:.1f}|{used_percent:.1f}", cache_text, cache_level,
+               config_text, progress_val, mem_level, stats_text)
+        if sig == self._mem_sig:
+            return
+        mem_text_changed = (self._mem_sig is None
+                            or sig[0] != self._mem_sig[0]
+                            or sig[1] != self._mem_sig[1]
+                            or sig[5] != self._mem_sig[5])
+        self._mem_sig = sig
+
+        # 更新标签文本
+        self.memory_info_label.setText(f"物理内存: {used_gb:.1f}GB / {total_gb:.1f}GB ({used_percent:.1f}%)")
+
+        # 更新缓存信息标签（档位变化才需要 polish 重刷样式）
+        self.cache_info_label.setText(cache_text)
+        cur_level = self.cache_info_label.property("labelType")
+        if (cur_level or "") != cache_level:
+            if cache_level:
+                StyleHelper.set_label_type(self.cache_info_label, cache_level)
+            else:
+                self.cache_info_label.setProperty("labelType", None)
+                self.cache_info_label.style().unpolish(self.cache_info_label)
+                self.cache_info_label.style().polish(self.cache_info_label)
+
+        # 更新配置信息标签
+        self.config_info_label.setText(config_text)
+
+        # 更新进度条
+        self.memory_progress.setValue(progress_val)
+
+        # 根据内存使用率设置进度条类型
+        cur_mem_level = self.memory_progress.property("progressType")
+        if cur_mem_level != mem_level:
+            StyleHelper.set_progress_type(self.memory_progress, f"memory-{mem_level}")
+
+        # 更新清理统计信息
         self.clean_stats_label.setText(stats_text)
 
     def _toggle_notifications(self, from_tray=False):
@@ -1892,7 +1954,7 @@ class MainWindow(QWidget):
             self.floating_window.shutdown()
             self.floating_window = None
 
-        # 停止 DNS 过滤服务并恢复系统 DNS
+        # 停止 DNS 过滤服务并恢复系统 DNS（DNS 页为懒创建，可能从未进入过该页签）
         if getattr(self, "dns_page", None) is not None:
             self.dns_page.shutdown()
 
