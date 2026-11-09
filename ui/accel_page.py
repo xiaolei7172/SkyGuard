@@ -19,13 +19,13 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget, QFrame,
+    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
+    QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget, QFrame,
 )
 
 from core import ip_optimizer
@@ -257,9 +257,40 @@ class AccelPage(QWidget):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-        layout.addWidget(self._build_control_group())
-        layout.addLayout(self._build_stats_row())
-        layout.addLayout(self._build_body())
+        # --- 模式切换：一键模式（默认）/ 高级模式 ---
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        self.easy_switch_btn = QPushButton("🚀 一键模式")
+        self.expert_switch_btn = QPushButton("⚙ 高级模式")
+        self.easy_switch_btn.setToolTip("一个按钮搞定：选节点 → 启动代理 → 智能分流 → 接管系统代理")
+        self.expert_switch_btn.setToolTip("内核、订阅、节点、规则、连接等全部手动控制")
+        for b in (self.easy_switch_btn, self.expert_switch_btn):
+            b.setCheckable(True)
+            StyleHelper.set_button_type(b, "default")
+        self.easy_switch_btn.setChecked(True)
+        self._view_group = QButtonGroup(self)
+        self._view_group.setExclusive(True)
+        self._view_group.addButton(self.easy_switch_btn)
+        self._view_group.addButton(self.expert_switch_btn)
+        self.easy_switch_btn.toggled.connect(self._switch_view)
+        mode_row.addWidget(self.easy_switch_btn)
+        mode_row.addWidget(self.expert_switch_btn)
+        mode_row.addStretch()
+
+        expert_page = QWidget()
+        expert_layout = QVBoxLayout(expert_page)
+        expert_layout.setContentsMargins(0, 0, 0, 0)
+        expert_layout.setSpacing(10)
+        expert_layout.addWidget(self._build_control_group())
+        expert_layout.addLayout(self._build_stats_row())
+        expert_layout.addLayout(self._build_body())
+
+        self.view_stack = QStackedWidget()
+        self.view_stack.addWidget(self._build_simple_view())
+        self.view_stack.addWidget(expert_page)
+
+        layout.addLayout(mode_row)
+        layout.addWidget(self.view_stack)
         layout.addStretch()
 
         self.refresh_node_table()
@@ -267,6 +298,146 @@ class AccelPage(QWidget):
         self.refresh_ip_table()
         self.refresh_stats()
         self.refresh_status()
+
+        settings = QSettings("SkyGuard", "SkyGuard")
+        if settings.value("accel_view", "easy") == "expert":
+            self.expert_switch_btn.setChecked(True)
+
+    # -- 一键模式 ------------------------------------------------------
+    def _switch_view(self):
+        easy = self.easy_switch_btn.isChecked()
+        self.view_stack.setCurrentIndex(0 if easy else 1)
+        QSettings("SkyGuard", "SkyGuard").setValue(
+            "accel_view", "easy" if easy else "expert")
+
+    def _build_simple_view(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(20, 12, 20, 20)
+        outer.setSpacing(12)
+
+        hero = QFrame()
+        hero.setObjectName("easyHero")
+        hero.setStyleSheet(
+            "#easyHero { background: #ffffff; border: 1px solid #e8e8e8;"
+            " border-radius: 12px; }")
+        box = QVBoxLayout(hero)
+        box.setContentsMargins(28, 24, 28, 24)
+        box.setSpacing(12)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        self.easy_dot = QLabel("●")
+        self.easy_dot.setStyleSheet("font-size: 26px; color: #bfbfbf;")
+        self.easy_title = QLabel("网络加速")
+        self.easy_title.setStyleSheet("font-size: 24px; font-weight: 700;")
+        self.easy_state = QLabel("未开启")
+        self.easy_state.setStyleSheet("color: #8c8c8c; font-size: 14px;")
+        head.addWidget(self.easy_dot)
+        head.addWidget(self.easy_title)
+        head.addStretch()
+        head.addWidget(self.easy_state)
+        box.addLayout(head)
+
+        self.easy_desc = QLabel(
+            "一键加速后：自动选择最快的订阅节点 → 启动本地代理 → 智能分流"
+            "（国内网站直连不绕路，国外网站走加速）→ 接管系统代理。"
+            "关闭时自动还原系统代理设置。")
+        self.easy_desc.setWordWrap(True)
+        self.easy_desc.setStyleSheet("color: #595959;")
+        box.addWidget(self.easy_desc)
+
+        self.easy_meta = QLabel("")
+        self.easy_meta.setWordWrap(True)
+        self.easy_meta.setStyleSheet("color: #8c8c8c;")
+        box.addWidget(self.easy_meta)
+
+        btn_row = QHBoxLayout()
+        self.easy_btn = QPushButton("🚀 一键加速")
+        self.easy_btn.setMinimumHeight(46)
+        self.easy_btn.setMinimumWidth(200)
+        self.easy_btn.setStyleSheet("font-size: 16px; font-weight: 600;")
+        self.easy_btn.clicked.connect(self.on_easy_toggle)
+        StyleHelper.set_button_type(self.easy_btn, "primary")
+        btn_row.addWidget(self.easy_btn)
+
+        self.easy_check_btn = QPushButton("自检一下")
+        self.easy_check_btn.setMinimumHeight(46)
+        self.easy_check_btn.setToolTip("实测代理链路：订阅拉取 → 节点测速 → 经代理访问外网")
+        self.easy_check_btn.clicked.connect(self.on_selfcheck)
+        StyleHelper.set_button_type(self.easy_check_btn, "default")
+        btn_row.addWidget(self.easy_check_btn)
+        btn_row.addStretch()
+        box.addLayout(btn_row)
+
+        self.easy_hint = QLabel("")
+        self.easy_hint.setWordWrap(True)
+        self.easy_hint.setStyleSheet("color: #8c8c8c;")
+        self.easy_hint.setVisible(False)
+        box.addWidget(self.easy_hint)
+        outer.addWidget(hero)
+
+        chips_row = QHBoxLayout()
+        chips_row.setSpacing(10)
+        self.easy_cards = {}
+        for key, title in (("total", "活动连接"), ("proxied", "走节点"),
+                           ("traffic", "累计流量"), ("sysproxy", "系统代理")):
+            card = QFrame()
+            card.setStyleSheet(
+                "QFrame { background: #fafafa; border: 1px solid #f0f0f0;"
+                " border-radius: 10px; }")
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(16, 12, 16, 12)
+            cap = QLabel(title)
+            cap.setStyleSheet("color: #8c8c8c; border: none; background: transparent;")
+            val = QLabel("0")
+            val.setStyleSheet("font-size: 20px; font-weight: 600; border: none;"
+                              " background: transparent;")
+            cv.addWidget(cap)
+            cv.addWidget(val)
+            self.easy_cards[key] = val
+            chips_row.addWidget(card, 1)
+        outer.addLayout(chips_row)
+        outer.addStretch()
+        return page
+
+    def on_easy_toggle(self):
+        if self._engine_running():
+            self.on_stop_proxy()
+            return
+        # 内核还没就绪时先自动进入下载流程，下好后用户再点一次即可
+        if self._engine() == "clash" and not clash_kernel.find_kernel(
+                getattr(self.config_manager, "proxy_kernel_path", "")):
+            self.easy_hint.setText(
+                "⏳ 首次使用需要下载加速内核（约 12MB），正在为你准备…"
+                "下载完成后请再点一次「一键加速」。")
+            self.easy_hint.setVisible(True)
+            self.on_locate_or_download_kernel()
+            return
+        # 傻瓜式默认：智能分流 + 自动接管系统代理
+        idx = self.mode_combo.findData(MODE_SMART)
+        if idx >= 0 and self.mode_combo.currentData() != MODE_SMART:
+            self.mode_combo.setCurrentIndex(idx)
+        if not self.sysproxy_check.isChecked():
+            self.sysproxy_check.setChecked(True)
+        self.on_start_proxy()
+
+    def _refresh_easy_state(self, running):
+        if not hasattr(self, "easy_btn"):
+            return
+        self.easy_btn.setText("⏹ 停止加速" if running else "🚀 一键加速")
+        StyleHelper.set_button_type(self.easy_btn, "danger" if running else "primary")
+        self.easy_dot.setStyleSheet(
+            f"font-size: 26px; color: {'#52c41a' if running else '#bfbfbf'};")
+        self.easy_state.setText("加速中 · 国内直连 / 国外走代理" if running else "未开启")
+
+    def _update_easy_stats(self, total, proxied, traffic):
+        easy = getattr(self, "easy_cards", None)
+        if not easy:
+            return
+        easy["total"].setText(str(total))
+        easy["proxied"].setText(str(proxied))
+        easy["traffic"].setText(traffic)
 
     # -- 服务控制 ----------------------------------------------------
     def _shrinkable_combo(self, combo):
@@ -765,6 +936,7 @@ class AccelPage(QWidget):
         self.status_pill.setStyleSheet(
             f"color: {color}; font-weight: 600; padding: 2px 8px; border-radius: 9px;")
         self.status_pill.setText("● 运行中" if running else "● 未运行")
+        self._refresh_easy_state(running)
 
     # ------------------------------------------------------------------
     # 服务启停
@@ -1075,6 +1247,9 @@ class AccelPage(QWidget):
         self.status_detail.setText(f"{node_state}    |    {proxy_state}")
         self.sysproxy_btn.setText("取消系统代理" if system_proxy.is_pointing_to(self.proxy.port)
                                   else "设为系统代理")
+        if hasattr(self, "easy_cards"):
+            self.easy_cards["sysproxy"].setText("已接管" if info["enabled"] else "未接管")
+            self.easy_meta.setText(f"{node_state} · {proxy_state}")
 
     def refresh_stats(self):
         # 页面不可见时不刷新，避免后台空转
@@ -1090,6 +1265,7 @@ class AccelPage(QWidget):
         traffic = f"↑{format_bytes(snap['up'])}  ↓{format_bytes(snap['down'])}"
         self.stat_cards["traffic"].setText(traffic)
         self._push_rates(snap["up"], snap["down"])
+        self._update_easy_stats(snap["active"], snap["proxied"], traffic)
 
         rows = snap["recent"]
         # 数据没变化就不重建表格，避免每秒抢焦点、滚动条乱跳
@@ -1132,6 +1308,7 @@ class AccelPage(QWidget):
         traffic = f"↑{format_bytes(info['up'])}  ↓{format_bytes(info['down'])}"
         self.stat_cards["traffic"].setText(traffic)
         self._push_rates(info["up"], info["down"])
+        self._update_easy_stats(info["active"], proxied, traffic)
 
         rows = []
         for c in reversed(conns):

@@ -19,13 +19,14 @@ import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QSettings, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+    QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTableWidget,
+    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from core import dns_lists
@@ -182,7 +183,6 @@ class DnsPage(QWidget):
 
         top_box.addLayout(btn_row)
         top_group.setLayout(top_box)
-        layout.addWidget(top_group)
 
         # --- 内嵌页签（对齐 AdGuard Home 的功能分区） ---
         self.tabs = QTabWidget()
@@ -193,13 +193,172 @@ class DnsPage(QWidget):
         self.tabs.addTab(self.log_tab, "  查询日志  ")
         self.tabs.addTab(self.filter_tab, "  过滤器与重写  ")
         self.tabs.currentChanged.connect(self.on_tab_changed)
-        layout.addWidget(self.tabs)
+
+        # --- 模式切换：一键模式（默认，一个按钮全搞定）/ 高级模式 ---
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        self.easy_switch_btn = QPushButton("🚀 一键模式")
+        self.expert_switch_btn = QPushButton("⚙ 高级模式")
+        self.easy_switch_btn.setToolTip("一个按钮搞定：启动服务 → 拦广告 → 接管系统 DNS")
+        self.expert_switch_btn.setToolTip("上游、过滤器、重写、日志等全部手动控制")
+        for b in (self.easy_switch_btn, self.expert_switch_btn):
+            b.setCheckable(True)
+            StyleHelper.set_button_type(b, "default")
+        self.easy_switch_btn.setChecked(True)
+        self._view_group = QButtonGroup(self)
+        self._view_group.setExclusive(True)
+        self._view_group.addButton(self.easy_switch_btn)
+        self._view_group.addButton(self.expert_switch_btn)
+        self.easy_switch_btn.toggled.connect(self._switch_view)
+        mode_row.addWidget(self.easy_switch_btn)
+        mode_row.addWidget(self.expert_switch_btn)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
+        expert_page = QWidget()
+        expert_layout = QVBoxLayout(expert_page)
+        expert_layout.setContentsMargins(0, 0, 0, 0)
+        expert_layout.setSpacing(10)
+        expert_layout.addWidget(top_group)
+        expert_layout.addWidget(self.tabs)
+
+        self.view_stack = QStackedWidget()
+        self.view_stack.addWidget(self._build_simple_view())
+        self.view_stack.addWidget(expert_page)
+        layout.addWidget(self.view_stack)
+
+        settings = QSettings("SkyGuard", "SkyGuard")
+        if settings.value("dns_view", "easy") == "expert":
+            self.expert_switch_btn.setChecked(True)
 
         self.refresh_adapters()
         self.reload_upstream_table()
         self.reload_list_table()
         self.reload_rewrite_table()
         self.refresh_stats()
+
+    # ---------------- 一键模式 ----------------
+    def _switch_view(self):
+        easy = self.easy_switch_btn.isChecked()
+        self.view_stack.setCurrentIndex(0 if easy else 1)
+        QSettings("SkyGuard", "SkyGuard").setValue(
+            "dns_view", "easy" if easy else "expert")
+
+    def _build_simple_view(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(20, 12, 20, 20)
+        outer.setSpacing(12)
+
+        hero = QFrame()
+        hero.setObjectName("easyHero")
+        hero.setStyleSheet(
+            "#easyHero { background: #ffffff; border: 1px solid #e8e8e8;"
+            " border-radius: 12px; }")
+        box = QVBoxLayout(hero)
+        box.setContentsMargins(28, 24, 28, 24)
+        box.setSpacing(12)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        self.easy_dot = QLabel("●")
+        self.easy_dot.setStyleSheet("font-size: 26px; color: #bfbfbf;")
+        self.easy_title = QLabel("DNS 去广告")
+        self.easy_title.setStyleSheet("font-size: 24px; font-weight: 700;")
+        self.easy_state = QLabel("未开启")
+        self.easy_state.setStyleSheet("color: #8c8c8c; font-size: 14px;")
+        head.addWidget(self.easy_dot)
+        head.addWidget(self.easy_title)
+        head.addStretch()
+        head.addWidget(self.easy_state)
+        box.addLayout(head)
+
+        self.easy_desc = QLabel(
+            "一键开启后：本机启动带广告过滤的 DNS 服务 → 自动接管系统 DNS → "
+            "所有软件的广告、跟踪域名自动拦截；关闭时自动恢复原 DNS，不留残留。")
+        self.easy_desc.setWordWrap(True)
+        self.easy_desc.setStyleSheet("color: #595959;")
+        box.addWidget(self.easy_desc)
+
+        self.easy_meta = QLabel("")
+        self.easy_meta.setWordWrap(True)
+        self.easy_meta.setStyleSheet("color: #8c8c8c;")
+        self.easy_meta.setVisible(False)
+        box.addWidget(self.easy_meta)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self.easy_btn = QPushButton("🚀 一键开启")
+        self.easy_btn.setMinimumHeight(46)
+        self.easy_btn.setMinimumWidth(200)
+        self.easy_btn.setStyleSheet("font-size: 16px; font-weight: 600;")
+        self.easy_btn.clicked.connect(self.on_easy_toggle)
+        StyleHelper.set_button_type(self.easy_btn, "primary")
+        btn_row.addWidget(self.easy_btn)
+
+        self.easy_check_btn = QPushButton("自检一下")
+        self.easy_check_btn.setMinimumHeight(46)
+        self.easy_check_btn.setToolTip("不改动任何设置，实测当前 DNS 配置通不通、能不能拦广告")
+        self.easy_check_btn.clicked.connect(self.on_selfcheck)
+        StyleHelper.set_button_type(self.easy_check_btn, "default")
+        btn_row.addWidget(self.easy_check_btn)
+        btn_row.addStretch()
+        box.addLayout(btn_row)
+
+        self.easy_hint = QLabel("")
+        self.easy_hint.setWordWrap(True)
+        self.easy_hint.setStyleSheet("color: #8c8c8c;")
+        self.easy_hint.setVisible(False)
+        box.addWidget(self.easy_hint)
+        outer.addWidget(hero)
+
+        chips_row = QHBoxLayout()
+        chips_row.setSpacing(10)
+        self.easy_cards = {}
+        for key, title in (("total", "累计查询"), ("blocked", "已拦截"),
+                           ("cache", "缓存命中率"), ("latency", "上游延迟")):
+            card = QFrame()
+            card.setStyleSheet(
+                "QFrame { background: #fafafa; border: 1px solid #f0f0f0;"
+                " border-radius: 10px; }")
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(16, 12, 16, 12)
+            cap = QLabel(title)
+            cap.setStyleSheet("color: #8c8c8c; border: none; background: transparent;")
+            val = QLabel("0")
+            val.setStyleSheet("font-size: 20px; font-weight: 600; border: none;"
+                              " background: transparent;")
+            cv.addWidget(cap)
+            cv.addWidget(val)
+            self.easy_cards[key] = val
+            chips_row.addWidget(card, 1)
+        outer.addLayout(chips_row)
+        outer.addStretch()
+        return page
+
+    def on_easy_toggle(self):
+        if self.filter.running:
+            self.on_stop()
+            return
+        if not ensure_admin(self, "一键开启 DNS 去广告"):
+            return
+        ok, errors = self._start_service()
+        if not ok:
+            QMessageBox.critical(self, "DNS 去广告",
+                                 "服务启动失败：\n" + "\n".join(errors))
+            return
+        done = []
+        for idx, name in self._checked_adapters():
+            ok2, _err = dns_takeover.take_over(idx)
+            if ok2:
+                done.append(name)
+        self._update_state()
+        if done:
+            self.easy_hint.setText("✅ 已开启，系统 DNS 已接管：" + "、".join(done))
+        else:
+            self.easy_hint.setText(
+                "服务已启动，但没有接管任何网卡——请到高级模式勾选网卡后再开一次。")
+        self.easy_hint.setVisible(True)
 
     # ---------------- 服务页 ----------------
     def _build_service_tab(self):
@@ -1225,6 +1384,13 @@ class DnsPage(QWidget):
                 latency = f"{slot['latency_ms']:.0f} ms"
         self.stat_cards["latency"].setText(latency)
 
+        easy = getattr(self, "easy_cards", None)
+        if easy is not None:
+            easy["total"].setText(str(snap["total"]))
+            easy["blocked"].setText(str(snap["blocked"]))
+            easy["cache"].setText(ratio)
+            easy["latency"].setText(latency)
+
         self.refresh_log()
         self._update_state()
 
@@ -1254,6 +1420,24 @@ class DnsPage(QWidget):
             f"<b>系统 DNS：</b>{dns_state}",
         ]
         self.state_label.setText("<br>".join(lines))
+        self._refresh_easy_state(running, sel, rules)
+
+    def _refresh_easy_state(self, running, sel, rules):
+        if not hasattr(self, "easy_btn"):
+            return
+        self.easy_btn.setText("⏹ 一键关闭" if running else "🚀 一键开启")
+        StyleHelper.set_button_type(self.easy_btn, "danger" if running else "primary")
+        self.easy_dot.setStyleSheet(
+            f"font-size: 26px; color: {'#52c41a' if running else '#bfbfbf'};")
+        self.easy_state.setText("已开启 · 广告自动拦截中" if running else "未开启")
+        if running:
+            self.easy_meta.setText(
+                f"当前上游：{sel.name + '（' + sel.proto + '）' if sel else '未配置上游'} · "
+                f"广告规则 {rules.count} 条 · 重写 {len(self.filter.rewrites)} 条"
+                + (f" · 系统 DNS 已接管" if dns_takeover._load_backup() else ""))
+        else:
+            self.easy_meta.setText("")
+        self.easy_meta.setVisible(bool(self.easy_meta.text()))
 
     def _style_pill(self, running):
         color = "#52c41a" if running else "#8c8c8c"
