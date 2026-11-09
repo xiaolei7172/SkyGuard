@@ -149,6 +149,12 @@ jobs:
             --include-data-dir=assets/icon=assets/icon `
             --include-data-dir=data=data `
             --windows-uac-admin `
+            --company-name="xiaolei7172" `
+            --product-name="SkyGuard" `
+            --file-description="SkyGuard 天幕进程优化工具" `
+            --product-version=$env:VERSION `
+            --file-version=$env:VERSION `
+            --copyright="GPL-3.0" `
             --remove-output `
             --enable-plugin=pyside6 `
             --lto=yes `
