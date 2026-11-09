@@ -230,6 +230,26 @@ class MainWindow(QWidget):
         # 初始应用组件属性
         self.apply_component_properties()
 
+        # 管理员模式下，启动后自动开启 DNS 去广告（服务 + 接管系统 DNS）。
+        # 延迟 2.5s：让窗口先完整显示；受限模式不做（没有接管权限，弹窗在 main 入口已处理）。
+        if is_admin():
+            QTimer.singleShot(2500, self._auto_start_dns)
+
+    def _auto_start_dns(self):
+        """主线程槽：物化 DNS 页（不切换页签）后自动开启 DNS 去广告。"""
+        page = getattr(self, "dns_page", None)
+        if page is None:
+            for widget in list(self._lazy_pages):
+                if self._lazy_pages[widget][2] == "dns_page":
+                    page = self._materialize_page(widget, switch=False)
+                    break
+        if page is None:
+            return
+        try:
+            page.auto_start_dns()
+        except Exception as e:
+            logger.warning(f"自动开启 DNS 失败: {e}")
+
     def _setup_admin_badge(self):
         """标题栏权限徽标：管理员模式 / 受限模式（点击查看说明，可一键提权）。"""
         self.admin_badge = QPushButton()
@@ -932,23 +952,34 @@ class MainWindow(QWidget):
         # 首次切到这些页时再创建/加载数据，避免启动变慢
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
+    def _materialize_page(self, widget, switch=True):
+        """把懒加载占位页替换为真实页面，返回创建的页面（已创建则返回 None）。
+
+        switch=False 用于后台自动启用某页（不抢当前页签焦点）。
+        """
+        factory = self._lazy_pages.get(widget)
+        if factory is None:
+            return None
+        ctor, title, attr_name = factory
+        self._building_page = True
+        try:
+            page = ctor()
+            setattr(self, attr_name, page)
+            self._lazy_pages.pop(widget)
+            tab_index = self.tabs.indexOf(widget)
+            self.tabs.removeTab(tab_index)
+            self.tabs.insertTab(tab_index, page, title)
+            if switch:
+                self.tabs.setCurrentIndex(tab_index)
+            return page
+        finally:
+            self._building_page = False
+
     def _on_tab_changed(self, index):
         """首次进入懒创建页时实例化真实页面，并按需加载数据"""
         widget = self.tabs.widget(index)
-        factory = self._lazy_pages.get(widget)
-        if factory is not None and not self._building_page:
-            self._building_page = True
-            try:
-                ctor, title, attr_name = factory
-                page = ctor()
-                setattr(self, attr_name, page)
-                self._lazy_pages.pop(widget)
-                tab_index = self.tabs.indexOf(widget)
-                self.tabs.removeTab(tab_index)
-                self.tabs.insertTab(tab_index, page, title)
-                self.tabs.setCurrentIndex(tab_index)
-            finally:
-                self._building_page = False
+        if widget in self._lazy_pages:
+            self._materialize_page(widget, switch=True)
             return
         if widget is self.startup_page and not getattr(self, "_startup_loaded", False):
             self._startup_loaded = True
@@ -2558,7 +2589,7 @@ class MainWindow(QWidget):
                 results.append(f"{service}: 服务不存在")
                 continue
 
-            # 程序已以管理员权限运行（--windows-uac-admin），直接调用 sc.exe 即可。
+            # 程序以管理员权限运行时（提权弹窗确认 / 开机自启计划任务），直接调用 sc.exe 即可。
             # 不再使用「临时 bat + Start-Process -Verb RunAs 隐藏执行」——该模式
             # 是杀软启发式重点识别的木马释放器特征，也是历史误报的重要来源。
             try:

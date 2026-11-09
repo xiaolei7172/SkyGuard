@@ -194,8 +194,20 @@ def enable_auto_start(app_name=None):
         # 清理任务名称，避免特殊字符
         task_name = f"{app_name}_AutoStart".replace(" ", "_")
 
-        # 获取当前程序路径
-        program_path = get_program_path()
+        # 获取当前程序路径。源码态（非打包）不能把 .py 当任务命令——
+        # 任务计划程序无法直接执行，必须落到 pythonw.exe + 脚本参数；
+        # 冒烟等非常规调用（argv[0] 不是 .py）则放弃创建，避免写坏任务。
+        if getattr(sys, "frozen", False):
+            program_path = sys.executable
+            program_args = "--minimized"
+        else:
+            script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0].endswith(".py") else ""
+            if not script or not os.path.isfile(script):
+                logger.warning("无法确定自启目标脚本，跳过开机自启创建")
+                return False
+            pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            program_path = pythonw if os.path.isfile(pythonw) else sys.executable
+            program_args = f'"{script}" --minimized'
 
         # 用带 RegistrationInfo（作者 / 描述）的任务 XML 创建，比裸 schtasks /create
         # 更规范：任务在任务计划程序里有明确来源说明，也便于用户在系统中辨识。
@@ -239,7 +251,7 @@ def enable_auto_start(app_name=None):
   <Actions Context="Author">
     <Exec>
       <Command>{program_path}</Command>
-      <Arguments>--minimized</Arguments>
+      <Arguments>{program_args}</Arguments>
     </Exec>
   </Actions>
 </Task>

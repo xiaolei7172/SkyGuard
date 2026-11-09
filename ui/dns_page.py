@@ -911,6 +911,41 @@ class DnsPage(QWidget):
             QMessageBox.warning(self, "恢复系统 DNS", err or "没有可恢复的备份")
         self._update_state()
 
+    def auto_start_dns(self):
+        """程序启动后自动开启 DNS 去广告（仅管理员模式会被调用）。
+
+        与一键开关的区别：非交互——失败不弹窗，只写提示条与日志；
+        网卡列表若还没异步枚举完，先同步补一次再取勾选。
+        """
+        if self.filter.running:
+            return
+        ok, errors = self._start_service()
+        if not ok:
+            logger.warning(f"DNS 服务自动启动失败: {errors}")
+            self._show_easy_hint("⚠️ DNS 服务自动启动失败：" + "；".join(errors))
+            return
+        if not self._adapters:
+            # 异步枚举还没回来：同步补一次，保证接管有网卡可选
+            self._fill_adapters(dns_takeover.list_adapters())
+        done = []
+        for idx, name in self._checked_adapters():
+            ok2, _err = dns_takeover.take_over(idx)
+            if ok2:
+                done.append(name)
+        self._update_state()
+        if done:
+            logger.info(f"DNS 已自动开启，接管网卡: {('、'.join(done))}")
+            self._show_easy_hint("✅ 已自动开启，系统 DNS 已接管：" + "、".join(done))
+        else:
+            logger.warning("DNS 服务已自动启动，但没有勾选任何 Up 状态网卡，未接管系统 DNS")
+            self._show_easy_hint("DNS 服务已自动启动，但没有可接管的网卡勾选，请到本页确认。")
+
+    def _show_easy_hint(self, text):
+        hint = getattr(self, "easy_hint", None)
+        if hint is not None:
+            hint.setText(text)
+            hint.setVisible(True)
+
     def on_stop(self):
         # 代理（mihomo 内核）可能正把 DNS 指向本机，停掉后代理会解析不了域名
         if self._proxy_depends_on_me():

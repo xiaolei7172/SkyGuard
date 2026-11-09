@@ -148,7 +148,7 @@ jobs:
             --include-data-files=$icon_path=favicon.ico `
             --include-data-dir=assets/icon=assets/icon `
             --include-data-dir=data=data `
-            --windows-uac-admin `
+            --windows-uac-as-invoker `
             --company-name="xiaolei7172" `
             --product-name="SkyGuard" `
             --file-description="SkyGuard 天幕进程优化工具" `

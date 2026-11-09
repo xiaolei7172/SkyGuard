@@ -193,7 +193,7 @@ cmd = [
     "--windows-icon-from-ico=" + icon_path,  # 设置图标
     "--include-data-dir=%s=assets/icon" % assets_icon_dir,  # 包含整个图标资源目录
     "--include-data-dir=%s=data" % os.path.join(root_dir, "data"),  # 国内 IP 段库
-    "--windows-uac-admin",  # 请求管理员权限
+    "--windows-uac-as-invoker",  # 不再自动弹 UAC：由程序启动时检测权限并弹窗询问
     # 版本信息资源：杀软误报的头号根因之一是"无版本信息的裸 exe"，
     # 本地构建与 CI 保持一致，务必注入完整版本资源。
     "--company-name=xiaolei7172",
