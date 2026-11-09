@@ -205,7 +205,8 @@ class MainWindow(QWidget):
         # 定时自动化任务巡检线程（每分钟看一次有没有到点；开关在设置页）
         from utils.scheduled_tasks import ScheduledTaskManager
         self.scheduled_tasks = ScheduledTaskManager(
-            self.config_manager, notify=self._notify_scheduled)
+            self.config_manager, notify=self._notify_scheduled,
+            on_ip_refreshed=self._on_scheduled_ip_refreshed)
         self.scheduled_tasks.start()
 
         # 状态缓存：内容没变就不 setText（富文本 setText 每次都要重新解析排版，
@@ -2153,6 +2154,18 @@ class MainWindow(QWidget):
         self.config_manager.log_retention_days = value
         if not self.config_manager.save_config():
             logger.warning("日志保留天数保存失败，本次修改仅在当前会话生效")
+
+    def _on_scheduled_ip_refreshed(self):
+        """定时优选写完盘：让加速页重新加载缓存（回调来自后台线程，切回主线程）。"""
+        def apply():
+            page = getattr(self, "accel_page", None)
+            if page is None:
+                return
+            try:
+                page.reload_ip_cache()
+            except Exception as e:
+                logger.debug(f"刷新加速页优选缓存失败: {e}")
+        QTimer.singleShot(0, apply)
 
     def _notify_scheduled(self, message):
         """定时任务完成提示（走系统通知，受通知开关控制）。"""

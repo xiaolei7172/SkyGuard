@@ -11,16 +11,26 @@
 import glob
 import json
 import os
+import threading
 import time
 
-from utils.logger import logger
+from utils import atomic_io
 
 SKYGUARD_DIR = os.path.join(os.path.expanduser("~"), ".skyguard")
 DAILY_FILE = os.path.join(SKYGUARD_DIR, "stats_daily.json")
 REPORT_DIR = os.path.join(SKYGUARD_DIR, "reports")
+TOTALS_FILE = os.path.join(SKYGUARD_DIR, "clean_totals.json")
 
 # 每日累计字段
 FIELDS = ("dns_queries", "dns_blocked", "proxy_total", "proxy_up", "proxy_down")
+
+# 落盘保留天数：load_daily 只看 30 天，留 180 天足够回溯，也避免文件无限增长
+KEEP_DAYS = 180
+
+# record_delta 是「读-改-写」，目前只有 UI 采样定时器在调；
+# 加锁是为了将来把采样搬到后台线程时不会静默丢计数。
+_daily_lock = threading.Lock()
+_totals_lock = threading.Lock()
 
 
 def _today():
@@ -28,26 +38,26 @@ def _today():
 
 
 def _load_daily():
-    try:
-        if os.path.exists(DAILY_FILE):
-            with open(DAILY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except (OSError, ValueError) as e:
-        logger.debug(f"读取每日统计失败: {e}")
-    return {}
+    return atomic_io.read_json(DAILY_FILE, default={}, expect=dict)
 
 
 def _save_daily(data):
-    try:
-        os.makedirs(SKYGUARD_DIR, exist_ok=True)
-        with open(DAILY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        return True
-    except OSError as e:
-        logger.debug(f"写入每日统计失败: {e}")
+    return atomic_io.write_json(DAILY_FILE, data)
+
+
+def _prune(data, today):
+    """只保留最近 KEEP_DAYS 天，返回是否有裁剪。"""
+    if len(data) <= KEEP_DAYS + 10:
         return False
+    try:
+        cutoff = time.strftime(
+            "%Y-%m-%d", time.localtime(time.time() - KEEP_DAYS * 86400))
+    except (OSError, ValueError, OverflowError):
+        return False
+    stale = [d for d in data if d < cutoff]
+    for d in stale:
+        data.pop(d, None)
+    return bool(stale)
 
 
 def record_delta(**deltas):
@@ -56,12 +66,14 @@ def record_delta(**deltas):
              if k in FIELDS and int(v) > 0}
     if not clean:
         return
-    data = _load_daily()
-    today = _today()
-    rec = data.setdefault(today, {k: 0 for k in FIELDS})
-    for k, v in clean.items():
-        rec[k] = int(rec.get(k, 0)) + v
-    _save_daily(data)
+    with _daily_lock:
+        data = _load_daily()
+        today = _today()
+        rec = data.setdefault(today, {k: 0 for k in FIELDS})
+        for k, v in clean.items():
+            rec[k] = int(rec.get(k, 0)) + v
+        _prune(data, today)
+        _save_daily(data)
 
 
 def load_daily(days=30):
@@ -99,14 +111,67 @@ def load_clean_reports(limit=200):
                 "failures": int(r.get("failures", 0) or 0),
                 "rule_count": len(r.get("rules", []) or []),
             })
-        except (OSError, ValueError) as e:
-            logger.debug(f"清理报告解析失败 {path}: {e}")
+        except (OSError, ValueError):
+            # 损坏的报告不阻塞整页刷新（warning 由调用方按签名去重）
+            continue
     return reports
 
 
+def reports_signature():
+    """报告目录的轻量签名（文件名+修改时间+大小），用于跳过无变化的重建。"""
+    try:
+        files = sorted(glob.glob(os.path.join(REPORT_DIR, "clean_*.json")))
+    except OSError:
+        return ()
+    sig = []
+    for path in files:
+        try:
+            st = os.stat(path)
+            sig.append((os.path.basename(path), int(st.st_mtime), st.st_size))
+        except OSError:
+            continue
+    return tuple(sig)
+
+
+def ensure_totals_seeded():
+    """首次使用累加账时，用现存报告播种（只做一次）。
+
+    老版本升级上来时 reports/ 里已有历史报告；如果直接等 record_clean 累加，
+    那些历史就永远漏统计了。空目录也写一份 0 值，标记"已播种"避免反复扫描。
+    """
+    with _totals_lock:
+        if atomic_io.read_json(TOTALS_FILE, default=None, expect=dict) is not None:
+            return False
+        reports = load_clean_reports(limit=10 ** 6)
+        totals = {
+            "count": len(reports),
+            "total_size": sum(r["total_size"] for r in reports),
+            "last_time": reports[0]["time"] if reports else "",
+            "seeded_at": _today(),
+        }
+        atomic_io.write_json(TOTALS_FILE, totals)
+        return True
+
+
+def record_clean(report):
+    """一次清理完成后累加到总量。
+
+    必须单独记账：报告文件只保留最近 200 份，若"累计释放空间"靠扫描报告求和，
+    轮转一次数字就会倒退。
+    """
+    ensure_totals_seeded()      # 历史先入账，避免首次清理时把老报告漏掉
+    with _daily_lock:
+        totals = atomic_io.read_json(TOTALS_FILE, default=None, expect=dict) or {}
+        totals["count"] = int(totals.get("count", 0)) + 1
+        totals["total_size"] = (int(totals.get("total_size", 0))
+                                + int(report.get("total_size", 0) or 0))
+        totals["last_time"] = str(report.get("time", "") or "")
+        atomic_io.write_json(TOTALS_FILE, totals)
+
+
 def clean_totals(reports=None):
-    """汇总清理历史：累计释放字节、次数。"""
-    if reports is None:
-        reports = load_clean_reports()
-    total_size = sum(r["total_size"] for r in reports)
-    return {"count": len(reports), "total_size": total_size}
+    """累计清理次数与释放字节（读累加账，轮转删报告也不受影响）。"""
+    ensure_totals_seeded()
+    totals = atomic_io.read_json(TOTALS_FILE, default={}, expect=dict) or {}
+    return {"count": int(totals.get("count", 0) or 0),
+            "total_size": int(totals.get("total_size", 0) or 0)}

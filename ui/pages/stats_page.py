@@ -1,9 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""历史统计中心页：清理历史 + DNS/代理每日用量。"""
+"""历史统计中心页：清理历史 + DNS/代理每日用量。
 
-from PySide6.QtCore import Qt
+两项数据都要读磁盘（报告目录最多 200 个 JSON），所以聚合全部放在后台线程，
+主线程只负责填表；并用签名缓存跳过"数据没变"的重建。
+"""
+
+import threading
+
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -13,6 +19,8 @@ from ui.styles import StyleHelper
 from utils import stats_history
 from utils.clean_engine import format_size
 from utils.logger import logger
+
+DAILY_DAYS = 30
 
 
 def _card(title, value):
@@ -33,10 +41,15 @@ def _card(title, value):
 class StatsPage(QWidget):
     """历史统计中心：累计清理、清理记录、每日 DNS/代理用量。"""
 
+    _load_done = Signal(object)   # (reports, totals, sig, daily_rows)
+
     def __init__(self, parent=None, config_manager=None):
         super().__init__(parent)
         self.config_manager = config_manager
+        self._clean_sig = None
         self._daily_sig = None
+        self._loading = False
+        self._load_done.connect(self._apply_data)
         self._init_ui()
         self.refresh()
 
@@ -72,7 +85,7 @@ class StatsPage(QWidget):
         layout.addWidget(clean_group, 3)
 
         # 每日用量
-        daily_group = QGroupBox("近 30 天每日用量（DNS 查询/拦截 · 代理连接/流量）")
+        daily_group = QGroupBox(f"近 {DAILY_DAYS} 天每日用量（DNS 查询/拦截 · 代理连接/流量）")
         daily_lay = QVBoxLayout()
         self.daily_table = QTableWidget(0, 6)
         self.daily_table.setHorizontalHeaderLabels(
@@ -102,18 +115,48 @@ class StatsPage(QWidget):
 
     # ------------------------------------------------------------------
     def refresh(self):
-        """重新聚合并填充两个表格与顶部卡片。"""
+        """后台重新聚合并刷新界面（不阻塞主线程）。"""
+        if self._loading:
+            return
+        self._loading = True
+        self.refresh_btn.setEnabled(False)
+        self.summary_label.setText("正在统计…")
+        threading.Thread(target=self._load_worker, daemon=True,
+                         name="StatsLoader").start()
+
+    def _load_worker(self):
+        reports, totals, sig, rows = [], {"count": 0, "total_size": 0}, (), []
         try:
-            self._refresh_clean()
-            self._refresh_daily()
+            sig = stats_history.reports_signature()
+            reports = stats_history.load_clean_reports()
+            totals = stats_history.clean_totals(reports)
+            rows = stats_history.load_daily(DAILY_DAYS)
+        except Exception as e:
+            logger.warning(f"统计页数据聚合失败: {e}")
+        try:
+            self._load_done.emit((reports, totals, sig, rows))
+        except RuntimeError:
+            pass   # 窗口已销毁，丢弃结果即可
+
+    def _apply_data(self, payload):
+        reports, totals, sig, rows = payload
+        self._loading = False
+        self.refresh_btn.setEnabled(True)
+        try:
+            self._fill_clean(reports, totals, sig)
+            self._fill_daily(rows)
         except Exception as e:
             logger.warning(f"统计页刷新失败: {e}")
 
-    def _refresh_clean(self):
-        reports = stats_history.load_clean_reports()
-        totals = stats_history.clean_totals(reports)
+    # ------------------------------------------------------------------
+    def _fill_clean(self, reports, totals, sig):
         self.lbl_total.setText(format_size(totals["total_size"]))
         self.lbl_count.setText(f"{totals['count']} 次")
+
+        # 报告目录没变化就跳过整表重建（setRowCount + setItem 上百次很贵）
+        if sig and sig == self._clean_sig:
+            return
+        self._clean_sig = sig
 
         self.clean_table.setRowCount(len(reports))
         for r, item in enumerate(reports):
@@ -130,8 +173,7 @@ class StatsPage(QWidget):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.clean_table.setItem(r, c, cell)
 
-    def _refresh_daily(self):
-        rows = stats_history.load_daily(30)
+    def _fill_daily(self, rows):
         head = rows[-1] if rows else {}
         sig = tuple((r["date"], r["dns_queries"], r["dns_blocked"],
                      r["proxy_total"], r["proxy_up"], r["proxy_down"])

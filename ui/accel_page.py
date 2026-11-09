@@ -542,6 +542,15 @@ class AccelPage(QWidget):
         self.api_port_spin.valueChanged.connect(self.on_api_port_changed)
         adv_row.addWidget(self.api_port_spin)
 
+        adv_row.addWidget(QLabel("优选数"))
+        self.top_n_spin = QSpinBox()
+        self.top_n_spin.setRange(1, 8)
+        self.top_n_spin.setValue(self.config_manager.proxy_top_n)
+        self.top_n_spin.setToolTip("每个域名保留的优选 IP 数量（测速后取前 N 个）")
+        self.top_n_spin.valueChanged.connect(self.on_top_n_changed)
+        self.top_n_spin.setFixedWidth(64)
+        adv_row.addWidget(self.top_n_spin)
+
         adv_row.addWidget(QLabel("内核路径"))
         self.kernel_path_edit = QLineEdit(self.config_manager.proxy_kernel_path or "")
         self.kernel_path_edit.setPlaceholderText("留空自动查找（含自动下载）")
@@ -1099,6 +1108,13 @@ class AccelPage(QWidget):
             return
         self.config_manager.set_proxy_config(clash_api_port=value)
         self.sub_hint.setText(f"API 端口已保存为 {value}，重启代理后生效")
+
+    def on_top_n_changed(self, value):
+        """优选 IP 保留数量：此前只能手编 config.yaml。"""
+        if value == self.config_manager.proxy_top_n:
+            return
+        self.config_manager.set_proxy_config(top_n=value)
+        self.sub_hint.setText(f"优选数量已保存为 {value}，下次测速生效")
 
     def on_kernel_path_edited(self):
         """手动指定内核路径：校验存在性后落盘。"""
@@ -2015,6 +2031,15 @@ class AccelPage(QWidget):
         ok, msg = ip_optimizer.restore_hosts()
         (QMessageBox.information if ok else QMessageBox.warning)(self, "还原 hosts", msg)
         self.accel_hint.setText(msg)
+
+    def reload_ip_cache(self):
+        """重新加载优选 IP 缓存并刷新表格。
+
+        定时任务在后台更新了 ip_cache.json，本页持有的是启动时的旧快照；
+        不重载的话运行中的代理会一直用旧 IP（要重启程序才生效）。
+        """
+        self.ip_cache.load(merge=True)
+        self.refresh_ip_table()
 
     def on_clear_ip_cache(self):
         if QMessageBox.question(self, "清空记录", "确定要清空优选 IP 缓存吗？") \

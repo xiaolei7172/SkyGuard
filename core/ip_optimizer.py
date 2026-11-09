@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
+from utils import atomic_io
 from utils.logger import logger
 
 # ----------------------------------------------------------------------
@@ -268,7 +269,12 @@ class IpCache:
         self._lock = threading.RLock()
         self.load()
 
-    def load(self):
+    def load(self, merge=True):
+        """从磁盘加载。
+
+        merge=True 时按 ts 取新（磁盘上更新的记录覆盖内存里的旧值），
+        这样可以反复调用而不会把别处（定时任务）刚写入的新结果冲掉。
+        """
         try:
             if not os.path.exists(self.path):
                 return
@@ -277,31 +283,39 @@ class IpCache:
             if isinstance(raw, dict):
                 with self._lock:
                     for domain, item in raw.items():
-                        if isinstance(item, dict) and isinstance(item.get("ips"), list):
-                            self.data[domain] = item
+                        if not (isinstance(item, dict) and isinstance(item.get("ips"), list)):
+                            continue
+                        if merge:
+                            cur = self.data.get(domain)
+                            if cur and cur.get("ts", 0) > item.get("ts", 0):
+                                continue
+                        self.data[domain] = item
         except Exception as e:
             logger.warning(f"读取优选 IP 缓存失败: {e}")
 
     def save(self):
         try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with self._lock:
                 snapshot = json.loads(json.dumps(self.data))
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, ensure_ascii=False, indent=2)
-            return True
+            # 原子写：缓存被 UI 与定时任务双写，截断重写一旦中断会整片丢失
+            return atomic_io.write_json(self.path, snapshot, indent=2)
         except Exception as e:
             logger.error(f"保存优选 IP 缓存失败: {e}")
             return False
 
     def update(self, results):
-        """接收 optimize_domains 的结果列表。"""
+        """接收 optimize_domains 的结果列表。
+
+        写盘前先合并磁盘上的最新内容：本实例可能是启动时加载的旧快照，
+        直接整文件覆盖会把定时任务刚写入的其他域名结果回滚掉。
+        """
         now = int(time.time())
         with self._lock:
+            self.load(merge=True)   # RLock 可重入
             for item in results:
                 if item.get("ips"):
                     self.data[item["domain"]] = {"ips": item["ips"], "ts": item.get("ts", now)}
-        self.save()
+            self.save()
 
     def best_ip(self, domain):
         """返回最优 IP，没有可用记录返回 None。"""

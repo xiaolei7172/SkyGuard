@@ -18,6 +18,7 @@
 """
 
 import os
+import glob
 import json
 import time
 import ctypes
@@ -59,6 +60,8 @@ SHERB_NOPROGRESSUI = 0x00000002
 SHERB_NOSOUND = 0x00000004
 
 REPORT_DIR = os.path.join(os.path.expanduser("~"), ".skyguard", "reports")
+REPORT_MAX_FILES = 200   # 报告只增不删会无限堆积，保留最近 N 份
+MIN_REPORT_KEEP = 20     # 无论谁调用，至少保留这么多份（防误删历史）
 
 # 保护区：任何删除路径只要落在这些目录里（或等于它们）就拒绝
 PROTECTED_DIRS = [
@@ -402,10 +405,21 @@ class CleanEngine:
         except OSError:
             return
 
-    def clean(self, rule_keys, to_recycle=True, progress=None):
-        """执行清理（同一时刻只允许一个清理任务，避免两个页面并发处理同一批文件）"""
-        with self._clean_lock:
+    def clean(self, rule_keys, to_recycle=True, progress=None, blocking=True):
+        """执行清理（同一时刻只允许一个清理任务，避免两个页面并发处理同一批文件）。
+
+        blocking=False 时若已有清理在跑，立刻返回 {"busy": True} 而不排队等待 ——
+        定时任务用它跳过本轮，避免 UI 手动清理被后台任务静默堵在锁上。
+        """
+        if not blocking and not self._clean_lock.acquire(blocking=False):
+            logger.debug("已有清理任务在运行，本次跳过")
+            return {"busy": True}
+        try:
+            if blocking:
+                self._clean_lock.acquire()
             return self._clean_locked(rule_keys, to_recycle, progress)
+        finally:
+            self._clean_lock.release()
 
     def _clean_locked(self, rule_keys, to_recycle=True, progress=None):
         """执行清理，返回报告 dict"""
@@ -499,11 +513,50 @@ class CleanEngine:
     def _save_report(report):
         try:
             os.makedirs(REPORT_DIR, exist_ok=True)
-            fn = f"clean_{time.strftime('%Y%m%d_%H%M%S')}.json"
-            with open(os.path.join(REPORT_DIR, fn), "w", encoding="utf-8") as f:
+            # 累计账：报告会被轮转删除，总量必须单独累加，否则统计页数字会倒退。
+            # 注意顺序 —— 先播种历史（此时新报告还没落盘，不会被重复计入），
+            # 再写报告，最后累加本次。
+            try:
+                from utils import stats_history
+                stats_history.ensure_totals_seeded()
+            except Exception:
+                stats_history = None
+            path = os.path.join(REPORT_DIR, f"clean_{time.strftime('%Y%m%d_%H%M%S')}.json")
+            # 同一秒连点两次清理会撞名：追加序号，别覆盖已有记录
+            if os.path.exists(path):
+                for i in range(1, 100):
+                    alt = path[:-5] + f"_{i}.json"
+                    if not os.path.exists(alt):
+                        path = alt
+                        break
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(report, f, ensure_ascii=False, indent=2)
+            CleanEngine._prune_reports()
+            if stats_history is not None:
+                try:
+                    stats_history.record_clean(report)
+                except Exception:
+                    pass
         except OSError as e:
             logger.warning(f"清理报告写入失败：{e}")
+
+    @staticmethod
+    def _prune_reports(keep=None):
+        """只保留最近 N 份报告，避免 reports 目录无限增长（统计页也只展示这些）。
+
+        keep 用 None 动态取模块常量（默认参数会在函数定义时固定，改常量不生效）；
+        并强制不低于 MIN_REPORT_KEEP，防止误传小值把用户历史报告删掉。
+        """
+        keep = max(MIN_REPORT_KEEP, int(keep or REPORT_MAX_FILES))
+        try:
+            files = sorted(glob.glob(os.path.join(REPORT_DIR, "clean_*.json")))
+            for path in files[:-keep] if len(files) > keep else []:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
 
 _engine = None

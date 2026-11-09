@@ -290,7 +290,11 @@ class LocalProxy:
         self._thread = None
         self._running = False
         self._stop_event = threading.Event()
-        self._conns = set()
+        # conn_id -> client socket。必须是自增整数而不是 id(socket)：
+        # socket 对象被回收后内存地址会被新连接复用，用 id 做标识会让
+        # "断开选中"误杀另一条完全无关的活跃连接。
+        self._conns = {}
+        self._conn_seq = 0
         self._conns_lock = threading.Lock()
         self.bind_errors = []
 
@@ -335,7 +339,7 @@ class LocalProxy:
             self._server = None
         # 主动断开在途连接，避免停止后线程还挂在 recv 上
         with self._conns_lock:
-            conns = list(self._conns)
+            conns = list(self._conns.values())
             self._conns.clear()
         for sock in conns:
             try:
@@ -367,30 +371,37 @@ class LocalProxy:
     def _accept_loop(self):
         while self._running:
             try:
-                client, _addr = self._server.accept()
+                server = self._server
+                if server is None:
+                    break
+                client, _addr = server.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
             with self._conns_lock:
-                self._conns.add(client)
-            threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
+                self._conn_seq += 1
+                conn_id = self._conn_seq
+                self._conns[conn_id] = client
+            threading.Thread(target=self._handle_client, args=(client, conn_id),
+                             daemon=True).start()
 
-    def _handle_client(self, client):
+    def _handle_client(self, client, conn_id=None):
         try:
             client.settimeout(30)
             first = client.recv(1, socket.MSG_PEEK)
             if not first:
                 return
             if first == b"\x05":
-                self._handle_socks5(client)
+                self._handle_socks5(client, conn_id)
             else:
-                self._handle_http(client)
+                self._handle_http(client, conn_id)
         except Exception as e:
             logger.debug(f"代理连接异常: {e}")
         finally:
-            with self._conns_lock:
-                self._conns.discard(client)
+            if conn_id is not None:
+                with self._conns_lock:
+                    self._conns.pop(conn_id, None)
             try:
                 client.close()
             except Exception:
@@ -399,16 +410,12 @@ class LocalProxy:
     def close_connection(self, conn_id):
         """按连接 ID 强制断开客户端 socket（内置引擎连接管理）。
 
-        conn_id 为 begin() 时记录的 id(client)。返回是否找到并关闭。
+        conn_id 由 accept 时分配的自增整数，已结束的连接查不到，返回 False。
         """
         if conn_id is None:
             return False
         with self._conns_lock:
-            target = None
-            for c in self._conns:
-                if id(c) == conn_id:
-                    target = c
-                    break
+            target = self._conns.pop(conn_id, None)
         if target is None:
             return False
         try:
@@ -498,10 +505,10 @@ class LocalProxy:
         down_thread.join()
         return counter["up"], counter["down"]
 
-    def _serve(self, client, host, port, is_connect, prelude=b""):
+    def _serve(self, client, host, port, is_connect, prelude=b"", conn_id=None):
         """匹配规则、建立上游、回写响应并转发。"""
         action, rule = self.engine.match(host, port)
-        entry = self.stats.begin(host, port, action, rule, conn_id=id(client))
+        entry = self.stats.begin(host, port, action, rule, conn_id=conn_id)
 
         if action == ACTION_REJECT:
             self.stats.finish(entry, error="已拒绝")
@@ -548,7 +555,7 @@ class LocalProxy:
                 pass
 
     # -- HTTP 代理 ---------------------------------------------------
-    def _handle_http(self, client):
+    def _handle_http(self, client, conn_id=None):
         buf = b""
         while b"\r\n\r\n" not in buf:
             chunk = client.recv(8192)
@@ -572,7 +579,7 @@ class LocalProxy:
             if not host:
                 _send(client, b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
                 return
-            self._serve(client, host, port, True)
+            self._serve(client, host, port, True, conn_id=conn_id)
             return
 
         # 普通 HTTP：把绝对 URL 改写成路径后转发
@@ -587,10 +594,10 @@ class LocalProxy:
             path += "?" + parts.query
         lines[0] = f"{method} {path} {version}".encode("latin-1")
         prelude = b"\r\n".join(lines) + b"\r\n\r\n" + rest
-        self._serve(client, host, port, False, prelude)
+        self._serve(client, host, port, False, prelude, conn_id=conn_id)
 
     # -- SOCKS5 ------------------------------------------------------
-    def _handle_socks5(self, client):
+    def _handle_socks5(self, client, conn_id=None):
         try:
             head = _recv_exact(client, 2)
             if head[0] != 5:
@@ -630,7 +637,7 @@ class LocalProxy:
             return
 
         action, rule = self.engine.match(host, port)
-        entry = self.stats.begin(host, port, action, rule, conn_id=id(client))
+        entry = self.stats.begin(host, port, action, rule, conn_id=conn_id)
         if action == ACTION_REJECT:
             self.stats.finish(entry, error="已拒绝")
             _send(client, b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
