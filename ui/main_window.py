@@ -2265,17 +2265,20 @@ class MainWindow(QWidget):
                 results.append(f"{service}: 服务不存在")
                 continue
 
-            # 创建提升权限的命令
+            # 程序已以管理员权限运行（--windows-uac-admin），直接调用 sc.exe 即可。
+            # 不再使用「临时 bat + Start-Process -Verb RunAs 隐藏执行」——该模式
+            # 是杀软启发式重点识别的木马释放器特征，也是历史误报的重要来源。
             try:
-                # 创建临时批处理文件
-                temp_bat_path = os.path.join(os.environ["TEMP"], f"delete_service_{i}.bat")
-                with open(temp_bat_path, "w") as f:
-                    f.write(f'@echo off\nsc stop "{service}"\nsc delete "{service}"\n')
-
-                # 使用管理员权限执行批处理文件 - 添加隐藏窗口参数
-                cmd = f'powershell -Command "Start-Process -WindowStyle Hidden -Verb RunAs cmd.exe -ArgumentList \'/c "{temp_bat_path}"\'"'
-                subprocess.run(cmd, shell=True, check=False)
-
+                subprocess.run(
+                    ["sc.exe", "stop", service],
+                    capture_output=True, text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW, check=False,
+                )
+                subprocess.run(
+                    ["sc.exe", "delete", service],
+                    capture_output=True, text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW, check=False,
+                )
                 # 等待操作完成
                 time.sleep(2)
 
@@ -2286,13 +2289,6 @@ class MainWindow(QWidget):
                 else:
                     results.append(f"{service}: 已成功删除")
                     success_count += 1
-
-                # 尝试删除临时文件
-                try:
-                    if os.path.exists(temp_bat_path):
-                        os.remove(temp_bat_path)
-                except:
-                    pass
             except Exception as e:
                 logger.error(f"删除服务 {service} 时出错: {str(e)}")
                 results.append(f"{service}: 删除出错 - {str(e)}")
@@ -2529,17 +2525,14 @@ class MainWindow(QWidget):
                 success_count += 1
                 continue
 
-            # 创建提升权限的命令
+            # 程序已以管理员权限运行，直接调用 sc.exe 停止服务
+            #（不再写临时 bat / 隐藏 RunAs，避免木马释放器式启发特征）
             try:
-                # 创建临时批处理文件
-                temp_bat_path = os.path.join(os.environ["TEMP"], f"stop_service_{i}.bat")
-                with open(temp_bat_path, "w") as f:
-                    f.write(f'@echo off\nsc stop "{service}"\n')
-
-                # 使用管理员权限执行批处理文件 - 添加隐藏窗口参数
-                cmd = f'powershell -Command "Start-Process -WindowStyle Hidden -Verb RunAs cmd.exe -ArgumentList \'/c "{temp_bat_path}"\'"'
-                subprocess.run(cmd, shell=True, check=False)
-
+                subprocess.run(
+                    ["sc.exe", "stop", service],
+                    capture_output=True, text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW, check=False,
+                )
                 # 等待操作完成
                 time.sleep(2)
 
@@ -2550,13 +2543,6 @@ class MainWindow(QWidget):
                 else:
                     results.append(f"{service}: 已成功停止")
                     success_count += 1
-
-                # 尝试删除临时文件
-                try:
-                    if os.path.exists(temp_bat_path):
-                        os.remove(temp_bat_path)
-                except:
-                    pass
             except Exception as e:
                 logger.error(f"停止服务 {service} 时出错: {str(e)}")
                 results.append(f"{service}: 停止出错 - {str(e)}")

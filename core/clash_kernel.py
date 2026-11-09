@@ -207,6 +207,24 @@ def download_kernel(dest_dir=None, progress=None):
 
     exe_path = os.path.join(dest_dir, os.path.basename(exe_name))
     target = os.path.join(dest_dir, KERNEL_FILENAME)
+
+    # 完整性校验：只接受 PE 格式且体积合理的内核，防止投毒/损坏文件被当内核执行
+    with open(exe_path, "rb") as fh:
+        head = fh.read(2)
+        size = fh.seek(0, 2)
+    if head != b"MZ":
+        try:
+            os.remove(exe_path)
+        except OSError:
+            pass
+        raise KernelNotFound("下载的内核文件不是有效的 Windows 可执行文件（缺少 PE 头），已拒绝安装")
+    if size < 1024 * 1024 or size > 512 * 1024 * 1024:
+        try:
+            os.remove(exe_path)
+        except OSError:
+            pass
+        raise KernelNotFound(f"内核文件体积异常（{size} 字节），已拒绝安装")
+
     if os.path.abspath(exe_path) != os.path.abspath(target):
         if os.path.isfile(target):
             os.remove(target)

@@ -193,37 +193,80 @@ def enable_auto_start(app_name=None):
     try:
         # 清理任务名称，避免特殊字符
         task_name = f"{app_name}_AutoStart".replace(" ", "_")
-        
+
         # 获取当前程序路径
         program_path = get_program_path()
-        
-        # 构建任务运行命令（程序路径 + --minimized参数）
-        task_command = f'"{program_path}" --minimized'
-        
-        # 使用schtasks命令创建任务
-        # /create: 创建新任务
-        # /tn: 任务名称
-        # /tr: 要运行的程序
-        # /sc onlogon: 登录时触发
-        # /rl highest: 以最高权限运行（跳过UAC）
-        # /f: 强制创建，覆盖现有任务
+
+        # 用带 RegistrationInfo（作者 / 描述）的任务 XML 创建，比裸 schtasks /create
+        # 更规范：任务在任务计划程序里有明确来源说明，也便于用户在系统中辨识。
+        #（避免"无描述 + 最高权限 + 登录触发"的匿名任务特征）
+        user = os.environ.get("USERNAME", "")
+        domain = os.environ.get("USERDOMAIN", "")
+        full_user = f"{domain}\\{user}" if domain and user else user
+
+        task_xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>SkyGuard</Author>
+    <Description>{app_name} 开机自启（由 {app_name} 设置创建，可在程序内一键取消）</Description>
+    <URI>\\{task_name}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{full_user}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{full_user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>Highest</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{program_path}</Command>
+      <Arguments>--minimized</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+        # XML 定义保存为应用数据目录下的常驻配置（非临时文件）
+        cfg_dir = os.path.join(os.path.expanduser("~"), ".skyguard")
+        os.makedirs(cfg_dir, exist_ok=True)
+        xml_path = os.path.join(cfg_dir, f"{task_name}.xml")
+        with open(xml_path, "w", encoding="utf-16") as f:
+            f.write(task_xml)
+
+        # /create /xml: 按定义文件创建任务；/f: 覆盖现有任务
         result = subprocess.run([
             "schtasks", "/create",
             "/tn", task_name,
-            "/tr", task_command,
-            "/sc", "onlogon",
-            "/rl", "highest",
+            "/xml", xml_path,
             "/f"
         ], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        
+
         if result.returncode == 0:
             logger.debug(f"已设置开机自启（任务计划程序），任务名称: {task_name}")
-            logger.debug(f"任务将以管理员权限运行，跳过UAC提示")
             return True
         else:
             logger.error(f"设置开机自启失败，错误信息: {result.stderr}")
             return False
-            
+
     except Exception as e:
         logger.error(f"设置开机自启失败: {str(e)}")
         return False
