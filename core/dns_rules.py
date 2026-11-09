@@ -20,12 +20,30 @@
   - `$` 后面的修饰符（如 $third-party）暂不支持，解析时直接忽略；
   - 例外规则永远优先于屏蔽规则，与 AdGuard 行为一致；
   - 全部规则编译成 exact / suffix / regex 三组索引，查询是 O(域名标签数)。
+
+strict（DNS 层严格）模式：
+  DNS 服务器只拿得到域名，拿不到 URL 路径和「哪个站点发起的请求」。因此：
+  - 带 `$domain=` / `$denyallow=` / `$client=` 等作用域修饰符的规则会跳过。
+    这类规则去掉修饰符后会退化成「整域放行/整域拦截」，把 qq.com、cloudflare.com
+    这种大站整体放行，等于把拦截功能废掉，宁可不用。
+  - 带路径的规则（`||host/path`、`|http://host/path`）同样跳过：
+    只能取主机名会连正常内容一起拦（或一起放），误伤面太大。
+  只有在严格模式下，`count` 才是「真正在 DNS 层生效的条数」。
 """
 
 import re
 
 COMMENT_PREFIXES = ("!", "#", "//", "[")
 HOSTS_PREFIXES = ("0.0.0.0", "127.0.0.1", "::1", "::", "255.255.255.255")
+
+# 带这些修饰符的规则必须结合「发起请求的站点」判断，DNS 层无法表达
+SCOPE_MODIFIERS = ("domain=", "denyallow=", "client=", "app=", "stealth=",
+                   "ctag=", "from=")
+
+# 元素隐藏 / 脚本注入类语法（`example.com##.ad`、`#@#`、`#$#`…）。
+# 这类规则只对浏览器版广告插件有意义，DNS 层必须整条丢弃：
+# 若按「取主机名」处理，会变成把 example.com 整站拦截。
+COSMETIC_MARKERS = ("##", "#@#", "#?#", "#@?#", "#$#", "#@$#", "#%#", "#@%#")
 
 MAX_REGEX_LEN = 400
 
@@ -61,17 +79,34 @@ class RuleSet:
         self._allow_regex = []
         self._lines = 0
         self._invalid = 0
+        self._skipped = 0
 
     # ---------------- 构建 ----------------
-    def add_line(self, line):
-        """加入一条规则。返回 'block' / 'allow' / None（无效或忽略）。"""
+    def add_line(self, line, strict=False):
+        """加入一条规则。返回 'block' / 'allow' / None（无效或忽略）。
+
+        strict=True 时按 DNS 层能力裁剪：跳过作用域修饰符与带路径的规则，
+        详见模块文档。
+        """
         raw = (line or "").strip().lstrip("\ufeff")
         if not raw or raw.startswith(COMMENT_PREFIXES):
             return None
-        # 去掉 AdGuard 修饰符
+        # 元素隐藏 / 脚本注入规则在 DNS 层无意义，且按域名解析会把整站误拦
+        if any(mark in raw for mark in COSMETIC_MARKERS):
+            self._skipped += 1
+            return None
+        # 去掉 AdGuard 修饰符（记录下修饰符，strict 模式要靠它判断作用域）
+        modifiers = ""
         if "$" in raw and not raw.startswith("/"):
-            raw = raw.split("$", 1)[0].strip()
+            raw, modifiers = raw.split("$", 1)
+            raw = raw.strip()
+            modifiers = modifiers.strip().lower()
         if not raw:
+            return None
+        if strict and modifiers and any(k in modifiers for k in SCOPE_MODIFIERS):
+            # 例：@@||cloudflare.com/cdn-cgi/trace$domain=net.ljxnet.cn
+            # 去掉 $domain 会变成「整站放行 cloudflare.com」，必须丢弃
+            self._skipped += 1
             return None
 
         allow = raw.startswith("@@")
@@ -122,7 +157,12 @@ class RuleSet:
 
         # ABP 域名锚定：||domain^
         if body.startswith("||"):
-            domain = body[2:].split("^", 1)[0].split("/", 1)[0]
+            rest = body[2:].split("^", 1)[0]
+            if strict and "/" in rest:
+                # ||host/path 只能按路径命中，DNS 层退化成整域会误伤
+                self._skipped += 1
+                return None
+            domain = rest.split("/", 1)[0]
             domain = normalize_domain(domain)
             if not domain:
                 self._invalid += 1
@@ -139,6 +179,9 @@ class RuleSet:
             body = body.lstrip("|")
             if "://" in body:
                 body = body.split("://", 1)[1]
+            if strict and "/" in body.split("^", 1)[0]:
+                self._skipped += 1
+                return None
             host = body.split("/", 1)[0].split("^", 1)[0]
             domain = normalize_domain(host)
             if not domain:
@@ -166,10 +209,46 @@ class RuleSet:
         self._lines += 1
         return "allow" if allow else "block"
 
-    def extend(self, lines):
+    def extend(self, lines, strict=False):
         for line in lines or ():
-            self.add_line(line)
+            self.add_line(line, strict=strict)
         return self._lines
+
+    # ------------- 编译结果复用（避免大列表每次重建都重新解析） -------------
+    def state(self):
+        """导出一份只读的编译结果快照，可被其他 RuleSet 用 absorb() 直接吸收。
+
+        返回的集合是 frozenset，外部只读，不会污染本对象。
+        """
+        return {
+            "exact": frozenset(self._exact),
+            "suffix": frozenset(self._suffix),
+            "regex": tuple(self._regex),
+            "allow_exact": frozenset(self._allow_exact),
+            "allow_suffix": frozenset(self._allow_suffix),
+            "allow_regex": tuple(self._allow_regex),
+            "lines": self._lines,
+            "invalid": self._invalid,
+            "skipped": self._skipped,
+        }
+
+    def absorb(self, state):
+        """吸收另一份编译结果（集合直接拷贝，比重放几十万行文本快一个量级）。"""
+        if not state:
+            return self
+        # 注意：空 frozenset 是假值，不能用 `or ()` 兜底（会是 tuple，|= 直接报错）
+        for key, target in (("exact", self._exact), ("suffix", self._suffix),
+                            ("allow_exact", self._allow_exact),
+                            ("allow_suffix", self._allow_suffix)):
+            src = state.get(key)
+            if src:
+                target |= src
+        self._regex.extend(state.get("regex") or ())
+        self._allow_regex.extend(state.get("allow_regex") or ())
+        self._lines += int(state.get("lines", 0) or 0)
+        self._invalid += int(state.get("invalid", 0) or 0)
+        self._skipped += int(state.get("skipped", 0) or 0)
+        return self
 
     # ---------------- 查询 ----------------
     @property
@@ -179,6 +258,11 @@ class RuleSet:
     @property
     def invalid(self):
         return self._invalid
+
+    @property
+    def skipped(self):
+        """strict 模式下被跳过的条数（作用域 / 带路径规则）。"""
+        return self._skipped
 
     @property
     def suffix_count(self):
@@ -262,12 +346,15 @@ def parse_filter_list(text):
     return rules
 
 
-def compile_rules(*rule_groups):
-    """把多组规则（列表可迭代对象或字符串）编译成一个 RuleSet。"""
+def compile_rules(*rule_groups, strict=False):
+    """把多组规则（列表可迭代对象或字符串）编译成一个 RuleSet。
+
+    strict=True 按 DNS 层能力裁剪（跳过作用域修饰符与带路径规则）。
+    """
     ruleset = RuleSet()
     for group in rule_groups:
         if isinstance(group, str):
-            ruleset.extend(parse_filter_list(group))
+            ruleset.extend(parse_filter_list(group), strict=strict)
         elif group:
-            ruleset.extend(group)
+            ruleset.extend(group, strict=strict)
     return ruleset

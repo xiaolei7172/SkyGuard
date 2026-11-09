@@ -455,6 +455,7 @@ class ConfigManager:
                     "cache_max_ttl": self.dns_cache_max_ttl,
                     "log_enabled": self.dns_log_enabled,
                     "lists": self.dns_lists,
+                    "lists_version": self.dns_lists_version,
                     "custom_rules": self.dns_custom_rules,
                     "rewrites": self.dns_rewrites,
                 },
@@ -576,6 +577,10 @@ class ConfigManager:
                     "updated": max(0, int(item.get("updated", 0) or 0)),
                 })
         self.dns_lists = cleaned_lists
+        try:
+            self.dns_lists_version = max(0, int(cfg.get("lists_version", 0) or 0))
+        except (TypeError, ValueError):
+            self.dns_lists_version = 0
 
         rules = cfg.get("custom_rules")
         self.dns_custom_rules = [str(r).strip() for r in rules
@@ -617,6 +622,7 @@ class ConfigManager:
             "cache_max_ttl": "dns_cache_max_ttl",
             "log_enabled": "dns_log_enabled",
             "lists": "dns_lists",
+            "lists_version": "dns_lists_version",
             "custom_rules": "dns_custom_rules",
             "rewrites": "dns_rewrites",
         }

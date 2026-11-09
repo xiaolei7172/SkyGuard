@@ -712,10 +712,13 @@ class DnsFilter:
         self._rebuild_rules()
 
     def _rebuild_rules(self):
-        rules = compile_rules(self._file_lines, self._extra_lines)
+        # strict=True：跳过作用域修饰符（$domain= 等）与带路径的规则，
+        # 这两类在 DNS 层只能退化成整域，会误放/误拦整站
+        rules = compile_rules(self._file_lines, self._extra_lines, strict=True)
         self._rules = rules
         logger.info(f"DNS 过滤规则已加载：{rules.count} 条"
-                    f"（后缀 {rules.suffix_count}，例外 {rules.allow_count}）")
+                    f"（后缀 {rules.suffix_count}，例外 {rules.allow_count}，"
+                    f"跳过 {rules.skipped}）")
         return rules
 
     def set_filter_sources(self, list_lines=None, custom_lines=None):
@@ -723,6 +726,26 @@ class DnsFilter:
         lines = list(list_lines or []) + list(custom_lines or [])
         self._extra_lines = lines
         return self._rebuild_rules()
+
+    def set_filter_states(self, list_states=None, custom_lines=None):
+        """用「已编译的列表规则」替换过滤器规则，避免重解析几十万行文本。
+
+        默认列表动辄二十多万条，每次改一个开关都重新解析要花几百毫秒；
+        直接吸收编译结果（集合拷贝）只需几十毫秒。
+        自定义规则是用户手写的少量条目，仍然全文解析（非严格模式，
+        保证 `||host/path` 这类写法按用户预期取主机名）。
+        """
+        rules = RuleSet()
+        for state in list_states or []:
+            rules.absorb(state)
+        rules.extend(self._file_lines)
+        rules.extend(custom_lines or [])
+        self._rules = rules
+        self._extra_lines = list(custom_lines or [])
+        logger.info(f"DNS 过滤规则已加载：{rules.count} 条"
+                    f"（列表 {sum(int(s.get('lines', 0) or 0) for s in (list_states or []))} 条，"
+                    f"后缀 {rules.suffix_count}，例外 {rules.allow_count}）")
+        return rules
 
     def reload_blocklist(self):
         """从 blocklist_path 重新加载黑名单。支持 hosts / 纯域名 / AdGuard 语法。"""

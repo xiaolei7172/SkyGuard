@@ -81,6 +81,7 @@ DEFAULT_CONFIG = {
         "cache_max_ttl": 86400,
         "log_enabled": True,                  # 记录查询日志（可暂停，不落盘）
         "lists": [],                          # 过滤器列表 [{name,url,enabled,interval,count,updated}]
+        "lists_version": 0,                   # 默认列表补齐版本（升级后自动补新增的默认订阅）
         "custom_rules": [],                   # 自定义规则（AdGuard 语法，一行一条）
         "rewrites": {},                       # DNS 重写 {域名: IP}
         "upstreams": [

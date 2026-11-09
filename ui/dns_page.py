@@ -98,11 +98,19 @@ class DnsPage(QWidget):
         self._updating_lists = False
         self.ui_call.connect(self._dispatch_ui)
         self.setup_ui()
-        self._rebuild_filter_rules()
+        # 首次编译大订阅放到后台，避免开窗卡顿；启动 DNS 服务前会再同步一次（此时已热）
+        self._rebuild_filter_rules_async()
 
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_stats)
         self.refresh_timer.start(2000)
+
+        # 启动后台自动更新：内置订阅首次使用、或超过 interval 未更新时拉一次
+        # （6MB 的规则集同步下载会卡界面，必须放后台线程）
+        self._auto_update_timer = QTimer(self)
+        self._auto_update_timer.setSingleShot(True)
+        self._auto_update_timer.timeout.connect(self._auto_update_lists)
+        self._auto_update_timer.start(2500)
 
     def _ui(self, func):
         """线程安全地把界面更新投递回主线程。"""
@@ -624,7 +632,10 @@ class DnsPage(QWidget):
         list_group = QGroupBox("过滤器列表")
         list_layout = QVBoxLayout()
         tip = QLabel("列表按勾选启用，规则与自定义规则一起生效；"
-                     "配置里只存地址与统计，规则内容缓存在本地，离线也能用。")
+                     "配置里只存地址与统计，规则内容缓存在本地，离线也能用。\n"
+                     "内置「天影规则」聚合订阅（广告拦截 + 误杀白名单），默认每天更新；"
+                     "规则数只统计 DNS 层能生效的条目——元素隐藏、带路径、"
+                     "$domain= 限定的规则会被自动跳过。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #8c8c8c;")
         list_layout.addWidget(tip)
@@ -764,12 +775,43 @@ class DnsPage(QWidget):
         self.filter.cache_max_ttl = self.config_manager.dns_cache_max_ttl
         self.filter.set_rewrites(self.config_manager.dns_rewrites)
 
-    def _rebuild_filter_rules(self):
-        """把「过滤器列表缓存 + 自定义规则」编译进过滤器。"""
-        lines, counts = dns_lists.merged_rules(self.config_manager.dns_lists)
-        rules = self.filter.set_filter_sources(lines, self.config_manager.dns_custom_rules)
+    def _rebuild_filter_rules_async(self):
+        """后台重建规则：首次要解析 20 多万条订阅（约 0.8 秒），不能卡开窗。
+
+        规则集整体替换是单次属性赋值，查询线程读的是旧对象，不会读到半成品。
+        """
+        entries = [dict(e) for e in self.config_manager.dns_lists]
+        custom = list(self.config_manager.dns_custom_rules)
+
+        def work():
+            states, counts = dns_lists.merged_states(entries)
+            self.filter.set_filter_states(states, custom)
+            self._ui(lambda: self._after_rules_rebuilt(counts))
+
+        threading_run(work)
+
+    def _after_rules_rebuilt(self, counts):
+        rules = self.filter.rules
         self.custom_summary.setText(
             f"自定义规则 {len(self.config_manager.dns_custom_rules)} 条 · "
+            f"订阅生效 {sum(counts.values())} 条 · "
+            f"合计生效 {rules.count} 条（含例外 {rules.allow_count}）")
+        if "后台编译" in self.list_hint.text():
+            self.list_hint.setText(
+                f"规则已生效：共 {rules.count} 条（含例外 {rules.allow_count}）")
+
+    def _rebuild_filter_rules(self):
+        """把「过滤器列表缓存 + 自定义规则」编译进过滤器。
+
+        列表规则用编译缓存（absorb 集合），几十万条也不用每次重解析；
+        只有列表内容更新或缓存失效时才重新解析。
+        """
+        states, counts = dns_lists.merged_states(self.config_manager.dns_lists)
+        rules = self.filter.set_filter_states(states, self.config_manager.dns_custom_rules)
+        list_total = sum(counts.values())
+        self.custom_summary.setText(
+            f"自定义规则 {len(self.config_manager.dns_custom_rules)} 条 · "
+            f"订阅生效 {list_total} 条 · "
             f"合计生效 {rules.count} 条（含例外 {rules.allow_count}）")
         return rules
 
@@ -1172,11 +1214,19 @@ class DnsPage(QWidget):
     # 过滤器列表
     # ------------------------------------------------------------------
     def reload_list_table(self):
-        entries = self.config_manager.dns_lists
-        if not entries:
-            entries = [dict(e) for e in dns_lists.DEFAULT_LISTS]
-            self.config_manager.set_dns_config(lists=entries)
+        entries = list(self.config_manager.dns_lists)
+        added = []
+        if self.config_manager.dns_lists_version < dns_lists.DEFAULT_LISTS_VERSION:
+            # 首次使用 / 版本升级：补上默认订阅（用户已删除的条目不会被动过）
+            entries, added = dns_lists.merge_default_lists(
+                entries, self.config_manager.dns_lists_version)
+            self.config_manager.set_dns_config(
+                lists=entries, lists_version=dns_lists.DEFAULT_LISTS_VERSION)
             self.config_manager.dns_lists = entries
+        else:
+            entries = [dict(e) for e in entries]
+        if added:
+            self.list_hint.setText(f"已内置 {len(added)} 个默认订阅，正在后台下载规则…")
         self.list_table.blockSignals(True)
         self.list_table.setRowCount(len(entries))
         for row, e in enumerate(entries):
@@ -1233,6 +1283,26 @@ class DnsPage(QWidget):
         self.reload_list_table()
         self._rebuild_filter_rules()
 
+    def _auto_update_lists(self):
+        """到期（interval 小时）的启用列表在后台自动更新，失败保留旧缓存。"""
+        if self._updating_lists:
+            return
+        entries = self.config_manager.dns_lists
+        todo = [e for e in entries if e.get("enabled", True) and dns_lists.is_due(e)]
+        if not todo:
+            return
+        self._updating_lists = True
+        self.list_hint.setText(f"正在后台更新 {len(todo)} 个列表…")
+
+        def work():
+            results = []
+            for e in todo:
+                count, err = dns_lists.update_list(e)
+                results.append((e.get("name") or e.get("url"), count, err))
+            self._ui(lambda: self._after_update_lists(results))
+
+        threading_run(work)
+
     def on_update_lists(self, only_selected=False, targets=None):
         if self._updating_lists:
             return
@@ -1266,7 +1336,8 @@ class DnsPage(QWidget):
         self._updating_lists = False
         self.config_manager.set_dns_config(lists=self.config_manager.dns_lists)
         self.reload_list_table()
-        rules = self._rebuild_filter_rules()
+        # 刚下载完的列表要重新解析（几十万条，约 1 秒），放后台避免卡界面
+        self._rebuild_filter_rules_async()
         ok = [f"{n}（{c} 条）" for n, c, err in results if not err]
         bad = [f"{n}：{err}" for n, c, err in results if err]
         parts = []
@@ -1274,7 +1345,7 @@ class DnsPage(QWidget):
             parts.append("更新成功：" + "、".join(ok))
         if bad:
             parts.append("失败：" + "；".join(bad))
-        parts.append(f"当前生效 {rules.count} 条")
+        parts.append("规则正在后台编译…")
         self.list_hint.setText("；".join(parts))
 
     # ------------------------------------------------------------------

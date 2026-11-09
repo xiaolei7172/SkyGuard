@@ -179,3 +179,81 @@ class TestBlockDomainsExport(unittest.TestCase):
         for i in range(30):
             rs.add_line(f"||d{i}.example.com^")
         self.assertEqual(len(rs.block_domains(limit=10)), 10)
+
+
+class TestStrictDnsMode(unittest.TestCase):
+    """strict 模式：DNS 层无法表达的作用域 / 路径规则必须跳过。
+
+    背景：天影白名单里有 `@@||cloudflare.com/cdn-cgi/trace$domain=x` 这类规则，
+    去掉 $domain 会变成「整域放行 cloudflare.com」，等于把拦截废掉。
+    """
+
+    def test_scoped_exception_skipped(self):
+        rs = RuleSet()
+        rs.add_line("||ads.tracker.com^")
+        rs.add_line("||cloudflare.com^")
+        rs.add_line("@@||cloudflare.com/cdn-cgi/trace$domain=site.com", strict=True)
+        self.assertTrue(rs.is_blocked("ads.tracker.com"))
+        # 作用域例外被丢弃 → cloudflare.com 仍然按屏蔽规则处理
+        self.assertTrue(rs.is_blocked("cdn.cloudflare.com"))
+        self.assertEqual(rs.skipped, 1)
+
+    def test_scoped_block_skipped(self):
+        rs = RuleSet()
+        rs.add_line("||cdn.shared.com^$domain=bad.com", strict=True)
+        self.assertFalse(rs.is_blocked("cdn.shared.com"))
+        self.assertEqual(rs.count, 0)
+
+    def test_path_rule_skipped_in_strict(self):
+        rs = RuleSet()
+        rs.add_line("||example.com/api/ad/*^", strict=True)
+        rs.add_line("|https://banner.example.com/x.js", strict=True)
+        self.assertEqual(rs.count, 0)
+        self.assertEqual(rs.skipped, 2)
+
+    def test_plain_and_modifier_kept(self):
+        rs = RuleSet()
+        rs.add_line("||ads.com^$third-party", strict=True)
+        rs.add_line("0.0.0.0 x.test", strict=True)
+        self.assertTrue(rs.is_blocked("ads.com"))
+        self.assertTrue(rs.is_blocked("x.test"))
+        self.assertEqual(rs.skipped, 0)
+
+    def test_non_strict_keeps_legacy_behaviour(self):
+        rs = RuleSet()
+        rs.add_line("|https://banner.example.com/path?x=1")
+        self.assertTrue(rs.is_blocked("banner.example.com"))
+        rs2 = RuleSet()
+        rs2.add_line("@@||cdn.example.com/x$domain=a.com")
+        self.assertFalse(rs2.is_blocked("cdn.example.com"))
+
+    def test_compile_rules_strict(self):
+        rs = compile_rules(["||a.com^", "||b.com/path^"], strict=True)
+        self.assertTrue(rs.is_blocked("a.com"))
+        self.assertFalse(rs.is_blocked("b.com"))
+        self.assertEqual(rs.count, 1)
+
+
+class TestStateReuse(unittest.TestCase):
+    """编译结果复用：absorb 出来的集合必须和重新解析完全一致。"""
+
+    def test_absorb_matches_recompile(self):
+        lines = ["||ads.com^", "@@||ok.ads.com^", "0.0.0.0 t.test", "/^ad[0-9]+\\.x\\.com$/"]
+        src = compile_rules(lines, strict=True)
+        dst = RuleSet().absorb(src.state())
+        self.assertEqual(dst.count, src.count)
+        for d in ("ads.com", "x.ads.com", "ok.ads.com", "t.test", "ad1.x.com", "www.qq.com"):
+            self.assertEqual(dst.match(d), src.match(d), d)
+
+    def test_absorb_two_states(self):
+        a = compile_rules(["||a.com^"]).state()
+        b = compile_rules(["@@||ok.a.com^", "||b.com^"]).state()
+        dst = RuleSet().absorb(a).absorb(b)
+        self.assertTrue(dst.is_blocked("a.com"))
+        self.assertFalse(dst.is_blocked("ok.a.com"))
+        self.assertTrue(dst.is_blocked("b.com"))
+        self.assertEqual(dst.count, 3)
+
+    def test_state_is_readonly(self):
+        st = compile_rules(["||a.com^"]).state()
+        self.assertIsInstance(st["suffix"], frozenset)
